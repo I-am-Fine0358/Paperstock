@@ -17,7 +17,7 @@ let currentTagId = null;
 let contextBookId = null;
 let viewMode = 'grid'; // 'grid' | 'stacks'
 let stacksExpanded = {}; // tagId -> boolean
-let bookshelfCardSize = 150; // px, controlled by slider
+let bookshelfCardSize = parseInt(localStorage.getItem('ps-card-size')) || 150;
 
 // Tab system
 let tabs = [];
@@ -39,6 +39,10 @@ let editingCommentTabId = null;
 // ── Init ─────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
     await loadData();
+    // Apply saved bookshelf card size
+    const grid = document.getElementById('book-grid');
+    grid.style.gridTemplateColumns = `repeat(auto-fill, minmax(${bookshelfCardSize}px, 1fr))`;
+    document.getElementById('bookshelf-zoom').value = bookshelfCardSize;
     renderBooks();
     renderTags();
     renderTabBar();
@@ -979,6 +983,7 @@ function setupEventListeners() {
     const bsZoomSlider = document.getElementById('bookshelf-zoom');
     bsZoomSlider.addEventListener('input', () => {
         bookshelfCardSize = parseInt(bsZoomSlider.value);
+        localStorage.setItem('ps-card-size', bookshelfCardSize);
         const grid = document.getElementById('book-grid');
         grid.style.gridTemplateColumns = `repeat(auto-fill, minmax(${bookshelfCardSize}px, 1fr))`;
         // Also update stack grids
