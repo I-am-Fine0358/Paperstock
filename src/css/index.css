@@ -493,6 +493,37 @@ body {
   gap: 10px;
 }
 
+/* Bookshelf zoom slider */
+.zoom-slider-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--text-tertiary);
+}
+
+.zoom-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 80px;
+  height: 4px;
+  background: var(--border);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+
+.zoom-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 14px;
+  height: 14px;
+  background: var(--accent);
+  border-radius: 50%;
+  cursor: pointer;
+  border: 2px solid white;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+}
+
 .search-box {
   display: flex;
   align-items: center;
@@ -859,6 +890,41 @@ body {
   text-align: center;
 }
 
+/* Viewer zoom slider */
+.viewer-zoom-slider-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.tool-btn-sm {
+  width: 24px;
+  height: 24px;
+}
+
+.viewer-zoom-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100px;
+  height: 3px;
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 2px;
+  outline: none;
+  cursor: pointer;
+}
+
+.viewer-zoom-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  background: var(--accent);
+  border-radius: 50%;
+  cursor: pointer;
+  border: 1.5px solid rgba(255, 255, 255, 0.5);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+}
+
 .vtoolbar-divider {
   width: 1px;
   height: 20px;
@@ -936,11 +1002,11 @@ body {
 }
 
 .viewer-pages {
-  padding: 20px;
+  padding: 4px;
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 12px;
+  gap: 4px;
 }
 
 .page-wrapper {

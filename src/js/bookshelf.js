@@ -17,6 +17,7 @@ let currentTagId = null;
 let contextBookId = null;
 let viewMode = 'grid'; // 'grid' | 'stacks'
 let stacksExpanded = {}; // tagId -> boolean
+let bookshelfCardSize = 150; // px, controlled by slider
 
 // Tab system
 let tabs = [];
@@ -140,7 +141,7 @@ function showPdfTab(tabId) {
         document.getElementById('page-total').textContent = state.totalPages;
         document.getElementById('page-input').value = state.currentPage;
         document.getElementById('page-input').max = state.totalPages;
-        document.getElementById('zoom-level').textContent = Math.round(state.scale * 100) + '%';
+        updateViewerZoomSlider(state);
         document.getElementById('btn-prev').disabled = state.currentPage <= 1;
         document.getElementById('btn-next').disabled = state.currentPage >= state.totalPages;
 
@@ -507,24 +508,64 @@ function viewerNav(delta) {
     renderPdfPages(activeTabId);
 }
 
-function viewerZoomIn() {
+function viewerSetZoom(newScale) {
     const state = pdfStates[activeTabId];
-    if (state) { state.scale = Math.min(state.scale * 1.2, 5.0); state.fitMode = false; renderPdfPages(activeTabId); }
+    if (!state) return;
+    state.scale = Math.max(0.3, Math.min(newScale, 5.0));
+    state.fitMode = false;
+    updateViewerZoomSlider(state);
+    renderPdfPages(activeTabId);
 }
-function viewerZoomOut() {
-    const state = pdfStates[activeTabId];
-    if (state) { state.scale = Math.max(state.scale * 0.8, 0.3); state.fitMode = false; renderPdfPages(activeTabId); }
+
+function viewerZoomIn() { const s = pdfStates[activeTabId]; if (s) viewerSetZoom(s.scale * 1.2); }
+function viewerZoomOut() { const s = pdfStates[activeTabId]; if (s) viewerSetZoom(s.scale * 0.8); }
+
+function updateViewerZoomSlider(state) {
+    const pct = Math.round(state.scale * 100);
+    document.getElementById('zoom-level').textContent = pct + '%';
+    document.getElementById('viewer-zoom-slider').value = pct;
 }
-async function viewerFitWidth() {
+
+// fitState cycles: 'none' -> 'height' -> 'width' -> 'none'
+let fitState = 'none';
+
+async function viewerFitCycle() {
     const state = pdfStates[activeTabId];
     if (!state || !state.pdfDoc) return;
-    const page = await state.pdfDoc.getPage(1);
-    const viewport = page.getViewport({ scale: 1.0 });
+    const page = await state.pdfDoc.getPage(state.currentPage);
+    const vp = page.getViewport({ scale: 1.0 });
     const container = document.getElementById('viewer-container');
-    let availW = container.clientWidth - 60;
-    if (state.spreadMode) availW = (availW - 4) / 2; // 2 pages side by side
-    state.scale = availW / viewport.width;
-    state.fitMode = true;
+    const padding = 8; // 4px each side
+    const availW = container.clientWidth - padding;
+    const availH = container.clientHeight - padding;
+    const fitBtn = document.getElementById('btn-fit');
+
+    if (fitState === 'none') {
+        // Fit height
+        let h = availH;
+        if (state.spreadMode && state.currentPage === 1) h = availH;
+        state.scale = h / vp.height;
+        fitState = 'height';
+        state.fitMode = true;
+        fitBtn.title = '縦に合わせ中 (もう1回で横に合わせる)';
+        fitBtn.classList.add('active');
+    } else if (fitState === 'height') {
+        // Fit width
+        let w = availW;
+        if (state.spreadMode && state.currentPage !== 1) w = (availW - 4) / 2;
+        state.scale = w / vp.width;
+        fitState = 'width';
+        state.fitMode = true;
+        fitBtn.title = '横に合わせ中 (もう1回で解除)';
+    } else {
+        // Back to manual
+        fitState = 'none';
+        state.fitMode = false;
+        fitBtn.title = '縦に合わせる';
+        fitBtn.classList.remove('active');
+        return; // Don't re-render, just release fit mode
+    }
+    updateViewerZoomSlider(state);
     renderPdfPages(activeTabId);
 }
 
@@ -533,7 +574,15 @@ function toggleSpreadMode() {
     if (!state) return;
     state.spreadMode = !state.spreadMode;
     document.getElementById('btn-spread').classList.toggle('active', state.spreadMode);
-    if (state.fitMode) viewerFitWidth();
+    if (state.fitMode) {
+        // Re-apply the current fit mode with spread considered
+        const prevFit = fitState;
+        fitState = 'none'; // reset so cycle re-enters
+        if (prevFit === 'height' || prevFit === 'width') {
+            fitState = prevFit === 'height' ? 'none' : 'height';
+            viewerFitCycle();
+        } else { renderPdfPages(activeTabId); }
+    }
     else renderPdfPages(activeTabId);
 }
 
@@ -926,16 +975,42 @@ function setupEventListeners() {
         btn.addEventListener('click', () => handleTabContextAction(btn.dataset.action));
     });
 
+    // ── Bookshelf zoom slider ──
+    const bsZoomSlider = document.getElementById('bookshelf-zoom');
+    bsZoomSlider.addEventListener('input', () => {
+        bookshelfCardSize = parseInt(bsZoomSlider.value);
+        const grid = document.getElementById('book-grid');
+        grid.style.gridTemplateColumns = `repeat(auto-fill, minmax(${bookshelfCardSize}px, 1fr))`;
+        // Also update stack grids
+        document.querySelectorAll('.stack-cards').forEach(sc => {
+            sc.style.gridTemplateColumns = `repeat(auto-fill, minmax(${bookshelfCardSize}px, 1fr))`;
+        });
+    });
+
     // ── PDF viewer controls ──
     document.getElementById('btn-prev').addEventListener('click', () => viewerNav(-1));
     document.getElementById('btn-next').addEventListener('click', () => viewerNav(1));
     document.getElementById('btn-zoom-in').addEventListener('click', viewerZoomIn);
     document.getElementById('btn-zoom-out').addEventListener('click', viewerZoomOut);
-    document.getElementById('btn-fit').addEventListener('click', viewerFitWidth);
+    document.getElementById('btn-fit').addEventListener('click', viewerFitCycle);
     document.getElementById('btn-spread').addEventListener('click', toggleSpreadMode);
     document.getElementById('btn-scroll-dir').addEventListener('click', toggleScrollDirection);
     document.getElementById('btn-comment-mode').addEventListener('click', toggleCommentMode);
     document.getElementById('btn-thumbnails').addEventListener('click', viewerToggleThumbnails);
+
+    // Viewer zoom slider
+    const vzSlider = document.getElementById('viewer-zoom-slider');
+    vzSlider.addEventListener('input', () => {
+        const state = pdfStates[activeTabId];
+        if (!state) return;
+        state.scale = parseInt(vzSlider.value) / 100;
+        state.fitMode = false;
+        fitState = 'none';
+        document.getElementById('btn-fit').classList.remove('active');
+        document.getElementById('btn-fit').title = '縦に合わせる';
+        document.getElementById('zoom-level').textContent = vzSlider.value + '%';
+        renderPdfPages(activeTabId);
+    });
 
     // Comment popup
     document.getElementById('comment-save').addEventListener('click', saveComment);
@@ -979,7 +1054,7 @@ function setupEventListeners() {
         if (e.key === ' ') { e.preventDefault(); viewerNav(e.shiftKey ? -1 : 1); }
         if ((e.metaKey || e.ctrlKey) && e.key === '=') { e.preventDefault(); viewerZoomIn(); }
         if ((e.metaKey || e.ctrlKey) && e.key === '-') { e.preventDefault(); viewerZoomOut(); }
-        if ((e.metaKey || e.ctrlKey) && e.key === '0') { e.preventDefault(); viewerFitWidth(); }
+        if ((e.metaKey || e.ctrlKey) && e.key === '0') { e.preventDefault(); fitState = 'none'; viewerFitCycle(); }
     });
 
     // Resize
@@ -988,7 +1063,11 @@ function setupEventListeners() {
         clearTimeout(resizeTimeout);
         resizeTimeout = setTimeout(() => {
             const state = pdfStates[activeTabId];
-            if (state && state.fitMode && state.loaded) viewerFitWidth();
+            if (state && state.fitMode && state.loaded) {
+                const prev = fitState;
+                fitState = prev === 'height' ? 'none' : 'height';
+                viewerFitCycle();
+            }
         }, 200);
     });
 }
