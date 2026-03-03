@@ -1,0 +1,1213 @@
+/* ══════════════════════════════════════════════════════
+   Paperstock — Main App Logic v3
+   Tab-based bookshelf + enhanced PDF viewer
+   ══════════════════════════════════════════════════════ */
+
+const TAG_COLORS = [
+    '#007aff', '#5856d6', '#af52de', '#ff2d55', '#ff3b30',
+    '#ff9500', '#ffcc00', '#34c759', '#00c7be', '#30b0c7',
+    '#5ac8fa', '#64d2ff', '#a2845e', '#8e8e93',
+];
+
+// ── State ────────────────────────────────────────────
+let allBooks = [];
+let allTags = [];
+let currentFilter = 'all';
+let currentTagId = null;
+let contextBookId = null;
+let viewMode = 'grid'; // 'grid' | 'stacks'
+let stacksExpanded = {}; // tagId -> boolean
+
+// Tab system
+let tabs = [];
+let tabGroups = [];
+let activeTabId = 'bookshelf';
+let nextTabId = 1;
+let nextGroupId = 1;
+
+// PDF viewer state per tab
+let pdfStates = {};
+let pdfjsLib = null;
+let pdfjsReady = false;
+
+// Comment state
+let commentMode = false;
+let editingCommentId = null;
+let editingCommentTabId = null;
+
+// ── Init ─────────────────────────────────────────────
+document.addEventListener('DOMContentLoaded', async () => {
+    await loadData();
+    renderBooks();
+    renderTags();
+    renderTabBar();
+    setupEventListeners();
+    initPdfJs();
+});
+
+async function loadData() {
+    allBooks = await window.api.getBooks();
+    allTags = await window.api.getTags();
+}
+
+async function initPdfJs() {
+    try {
+        const paths = await window.api.getPdfjsPaths();
+        const module = await import(paths.pdf);
+        pdfjsLib = module;
+        pdfjsLib.GlobalWorkerOptions.workerSrc = paths.worker;
+        pdfjsReady = true;
+    } catch (e) {
+        console.error('Failed to initialize PDF.js:', e);
+    }
+}
+
+// ══════════════════════════════════════════════════════
+//  TAB MANAGEMENT
+// ══════════════════════════════════════════════════════
+
+function openPdfTab(bookId) {
+    const existing = tabs.find(t => t.type === 'pdf' && t.bookId === bookId);
+    if (existing) { activateTab(existing.id); return; }
+
+    const book = allBooks.find(b => b.id === bookId);
+    if (!book) return;
+
+    const tabId = 'pdf-' + nextTabId++;
+    tabs.push({ id: tabId, type: 'pdf', bookId, title: book.title, groupId: null });
+    activateTab(tabId);
+    renderTabBar();
+    loadPdfForTab(tabId, book);
+}
+
+function closeTab(tabId) {
+    const idx = tabs.findIndex(t => t.id === tabId);
+    if (idx === -1) return;
+    if (pdfStates[tabId]) {
+        if (pdfStates[tabId].pdfDoc) pdfStates[tabId].pdfDoc.destroy();
+        delete pdfStates[tabId];
+    }
+    tabs.splice(idx, 1);
+    if (activeTabId === tabId) activateTab('bookshelf');
+    renderTabBar();
+}
+
+function activateTab(tabId) {
+    activeTabId = tabId;
+    document.querySelectorAll('.tab-item').forEach(el => {
+        el.classList.toggle('active', el.dataset.tabId === tabId);
+    });
+
+    const bookshelfView = document.getElementById('bookshelf-view');
+    const viewerView = document.getElementById('viewer-view');
+
+    if (tabId === 'bookshelf') {
+        bookshelfView.classList.add('active');
+        viewerView.classList.remove('active');
+        hideCommentPopup();
+    } else {
+        bookshelfView.classList.remove('active');
+        viewerView.classList.add('active');
+        showPdfTab(tabId);
+    }
+}
+
+function showPdfTab(tabId) {
+    const state = pdfStates[tabId];
+    if (!state) return;
+
+    document.getElementById('viewer-title').textContent = state.title || '';
+    document.getElementById('viewer-loading').style.display = state.loaded ? 'none' : 'flex';
+
+    // Update toolbar toggle states
+    document.getElementById('btn-spread').classList.toggle('active', state.spreadMode || false);
+    document.getElementById('btn-comment-mode').classList.toggle('active', commentMode);
+
+    const scrollBtn = document.getElementById('btn-scroll-dir');
+    if (state.scrollDir === 'horizontal') {
+        scrollBtn.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>';
+        scrollBtn.title = '横スクロール (クリックで縦に)';
+    } else {
+        scrollBtn.innerHTML = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><polyline points="19 12 12 19 5 12"/></svg>';
+        scrollBtn.title = '縦スクロール (クリックで横に)';
+    }
+
+    const container = document.getElementById('viewer-container');
+    container.classList.toggle('comment-mode', commentMode);
+    container.classList.toggle('horizontal', state.scrollDir === 'horizontal');
+
+    if (state.loaded) {
+        document.getElementById('page-total').textContent = state.totalPages;
+        document.getElementById('page-input').value = state.currentPage;
+        document.getElementById('page-input').max = state.totalPages;
+        document.getElementById('zoom-level').textContent = Math.round(state.scale * 100) + '%';
+        document.getElementById('btn-prev').disabled = state.currentPage <= 1;
+        document.getElementById('btn-next').disabled = state.currentPage >= state.totalPages;
+
+        const sidebar = document.getElementById('viewer-sidebar');
+        sidebar.classList.toggle('open', state.thumbnailsOpen || false);
+
+        renderPdfPages(tabId);
+    }
+}
+
+// Tab bar rendering (same as before)
+function renderTabBar() {
+    const container = document.getElementById('tab-groups-container');
+    container.innerHTML = '';
+    document.getElementById('tab-bookshelf').classList.toggle('active', activeTabId === 'bookshelf');
+
+    for (const group of tabGroups) {
+        const groupEl = document.createElement('div');
+        groupEl.className = 'tab-group' + (group.collapsed ? ' collapsed' : '');
+        const header = document.createElement('div');
+        header.className = 'tab-group-header' + (group.collapsed ? ' collapsed' : '');
+        header.innerHTML = `
+      <span class="group-dot" style="background:${group.color}"></span>
+      <span>${escapeHtml(group.name)}</span>
+      <span class="tab-group-actions">
+        <button class="group-action-btn" data-group-action="edit" data-group-id="${group.id}" title="編集">
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+        </button>
+        <button class="group-action-btn" data-group-action="delete" data-group-id="${group.id}" title="削除">
+          <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+        </button>
+      </span>
+      <svg class="group-chevron" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+    `;
+        header.addEventListener('click', (e) => {
+            if (e.target.closest('[data-group-action]')) return;
+            group.collapsed = !group.collapsed; renderTabBar();
+        });
+        header.querySelectorAll('[data-group-action]').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const gid = parseInt(btn.dataset.groupId);
+                if (btn.dataset.groupAction === 'edit') openGroupModal(tabGroups.find(g => g.id === gid));
+                else if (btn.dataset.groupAction === 'delete') {
+                    tabs.forEach(t => { if (t.groupId === gid) t.groupId = null; });
+                    tabGroups = tabGroups.filter(g => g.id !== gid); renderTabBar();
+                }
+            });
+        });
+        groupEl.appendChild(header);
+        const tabsContainer = document.createElement('div');
+        tabsContainer.className = 'tab-group-tabs';
+        tabs.filter(t => t.groupId === group.id).forEach(tab => tabsContainer.appendChild(createTabElement(tab)));
+        groupEl.appendChild(tabsContainer);
+        container.appendChild(groupEl);
+    }
+
+    const ungrouped = tabs.filter(t => !t.groupId);
+    if (ungrouped.length > 0) {
+        const div = document.createElement('div');
+        div.className = 'ungrouped-tabs';
+        ungrouped.forEach(tab => div.appendChild(createTabElement(tab)));
+        container.appendChild(div);
+    }
+}
+
+function createTabElement(tab) {
+    const el = document.createElement('button');
+    el.className = 'tab-item' + (activeTabId === tab.id ? ' active' : '');
+    el.dataset.tabId = tab.id;
+    el.title = tab.title;
+    el.innerHTML = `
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+      <polyline points="14 2 14 8 20 8"/>
+    </svg>
+    <span class="tab-label">${escapeHtml(tab.title)}</span>
+    <span class="tab-close" title="閉じる">×</span>
+  `;
+    el.addEventListener('click', (e) => {
+        if (e.target.closest('.tab-close')) { e.stopPropagation(); closeTab(tab.id); return; }
+        activateTab(tab.id);
+    });
+    el.addEventListener('contextmenu', (e) => {
+        e.preventDefault(); showTabContextMenu(e.clientX, e.clientY, tab.id);
+    });
+    return el;
+}
+
+// ══════════════════════════════════════════════════════
+//  PDF VIEWER — enhanced
+// ══════════════════════════════════════════════════════
+
+async function loadPdfForTab(tabId, book) {
+    pdfStates[tabId] = {
+        title: book.title,
+        pdfDoc: null,
+        currentPage: 1,
+        totalPages: 0,
+        scale: 1.0,
+        fitMode: true,
+        thumbnailsOpen: false,
+        loaded: false,
+        bookId: book.id,
+        spreadMode: false,
+        scrollDir: 'vertical', // 'vertical' | 'horizontal'
+        comments: [],
+    };
+
+    if (activeTabId === tabId) {
+        document.getElementById('viewer-loading').style.display = 'flex';
+        document.getElementById('viewer-title').textContent = book.title;
+    }
+
+    if (!pdfjsReady) { await initPdfJs(); if (!pdfjsReady) return; }
+
+    try {
+        const pdfData = await window.api.readPdfFile(book.file_path);
+        const data = new Uint8Array(pdfData);
+        const doc = await pdfjsLib.getDocument({ data }).promise;
+
+        const state = pdfStates[tabId];
+        if (!state) return;
+
+        state.pdfDoc = doc;
+        state.totalPages = doc.numPages;
+        state.loaded = true;
+
+        // Load comments
+        state.comments = await window.api.getComments(book.id);
+
+        // Calculate fit-width scale
+        const page = await doc.getPage(1);
+        const viewport = page.getViewport({ scale: 1.0 });
+        const container = document.getElementById('viewer-container');
+        const containerWidth = container.clientWidth - 60;
+        state.scale = containerWidth / viewport.width;
+
+        if (activeTabId === tabId) showPdfTab(tabId);
+    } catch (err) {
+        console.error('Failed to load PDF:', err);
+        if (pdfStates[tabId] && activeTabId === tabId) {
+            const loading = document.getElementById('viewer-loading');
+            loading.innerHTML = `
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#ff3b30" stroke-width="1.5">
+          <circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/>
+          <line x1="9" y1="9" x2="15" y2="15"/>
+        </svg>
+        <p style="color:#ff3b30">PDFの読み込みに失敗しました</p>
+      `;
+        }
+    }
+}
+
+async function renderPdfPages(tabId) {
+    const state = pdfStates[tabId];
+    if (!state || !state.pdfDoc || tabId !== activeTabId) return;
+
+    const pagesContainer = document.getElementById('viewer-pages');
+
+    hideCommentPopup();
+
+    // Double-buffer: render new content offscreen first, then swap
+    const buffer = document.createDocumentFragment();
+    const tempHolder = document.createElement('div');
+    tempHolder.style.position = 'absolute';
+    tempHolder.style.visibility = 'hidden';
+    tempHolder.style.pointerEvents = 'none';
+    document.body.appendChild(tempHolder);
+
+    if (state.spreadMode) {
+        await renderSpreadView(tabId, tempHolder, state);
+    } else {
+        await renderSinglePage(tabId, tempHolder, state);
+    }
+
+    // Move rendered content to the buffer
+    while (tempHolder.firstChild) {
+        buffer.appendChild(tempHolder.firstChild);
+    }
+    document.body.removeChild(tempHolder);
+
+    // Atomic swap: clear and insert in one go
+    pagesContainer.innerHTML = '';
+    pagesContainer.classList.toggle('spread', state.spreadMode);
+    pagesContainer.classList.toggle('horizontal', state.scrollDir === 'horizontal');
+    pagesContainer.appendChild(buffer);
+
+    // UI controls
+    document.getElementById('page-input').value = state.currentPage;
+    document.getElementById('page-total').textContent = state.totalPages;
+    document.getElementById('zoom-level').textContent = Math.round(state.scale * 100) + '%';
+    document.getElementById('btn-prev').disabled = state.currentPage <= 1;
+    document.getElementById('btn-next').disabled = state.currentPage >= state.totalPages;
+
+    document.getElementById('viewer-container').scrollTop = 0;
+    document.getElementById('viewer-container').scrollLeft = 0;
+    updateThumbnailHighlight(tabId);
+}
+
+async function renderSinglePage(tabId, container, state) {
+    const wrapper = await createRenderedPage(state, state.currentPage, tabId);
+    if (wrapper) container.appendChild(wrapper);
+}
+
+async function renderSpreadView(tabId, container, state) {
+    // Page 1 alone (cover), then 2-3, 4-5, etc.
+    let startPage = state.currentPage;
+    // Align to spread: cover=1, then even-odd pairs
+    if (startPage === 1) {
+        const w = await createRenderedPage(state, 1, tabId);
+        if (w) container.appendChild(w);
+    } else {
+        // Ensure even start for left page
+        if (startPage % 2 === 1) startPage--;
+        if (startPage < 2) startPage = 2;
+
+        const pair = document.createElement('div');
+        pair.className = 'spread-pair';
+        const left = await createRenderedPage(state, startPage, tabId);
+        if (left) pair.appendChild(left);
+        if (startPage + 1 <= state.totalPages) {
+            const right = await createRenderedPage(state, startPage + 1, tabId);
+            if (right) pair.appendChild(right);
+        }
+        container.appendChild(pair);
+    }
+}
+
+async function createRenderedPage(state, pageNum, tabId) {
+    try {
+        const page = await state.pdfDoc.getPage(pageNum);
+        const viewport = page.getViewport({ scale: state.scale });
+
+        const wrapper = document.createElement('div');
+        wrapper.className = 'page-wrapper';
+        wrapper.style.width = viewport.width + 'px';
+        wrapper.style.height = viewport.height + 'px';
+        wrapper.dataset.page = pageNum;
+
+        const canvas = document.createElement('canvas');
+        canvas.className = 'page-canvas';
+        const ctx = canvas.getContext('2d');
+        const dpr = window.devicePixelRatio || 1;
+        canvas.width = viewport.width * dpr;
+        canvas.height = viewport.height * dpr;
+        canvas.style.width = viewport.width + 'px';
+        canvas.style.height = viewport.height + 'px';
+        ctx.scale(dpr, dpr);
+        wrapper.appendChild(canvas);
+
+        await page.render({ canvasContext: ctx, viewport }).promise;
+
+        // Add comment markers for this page
+        const pageComments = (state.comments || []).filter(c => c.page_num === pageNum);
+        for (const comment of pageComments) {
+            const marker = document.createElement('div');
+            marker.className = 'comment-marker' + (comment.content ? ' has-content' : '');
+            marker.style.left = (comment.x * 100) + '%';
+            marker.style.top = (comment.y * 100) + '%';
+            marker.style.background = comment.color || '#ffcc00';
+            marker.dataset.commentId = comment.id;
+            marker.addEventListener('click', (e) => {
+                e.stopPropagation();
+                openCommentPopup(comment, e.clientX, e.clientY, tabId);
+            });
+            wrapper.appendChild(marker);
+        }
+
+        // Click to add comment in comment mode
+        wrapper.addEventListener('click', (e) => {
+            if (!commentMode) return;
+            if (e.target.closest('.comment-marker')) return;
+            const rect = wrapper.getBoundingClientRect();
+            const x = (e.clientX - rect.left) / rect.width;
+            const y = (e.clientY - rect.top) / rect.height;
+            addNewComment(tabId, pageNum, x, y, e.clientX, e.clientY);
+        });
+
+        return wrapper;
+    } catch (err) {
+        console.error('Render error page', pageNum, err);
+        return null;
+    }
+}
+
+// ── Comment functions ────────────────────────────────
+async function addNewComment(tabId, pageNum, x, y, screenX, screenY) {
+    const state = pdfStates[tabId];
+    if (!state) return;
+
+    const comment = await window.api.addComment({
+        bookId: state.bookId, pageNum, x, y, content: '', color: '#ffcc00'
+    });
+
+    state.comments.push(comment);
+    renderPdfPages(tabId);
+
+    // Open popup for editing
+    setTimeout(() => openCommentPopup(comment, screenX, screenY, tabId), 100);
+}
+
+function openCommentPopup(comment, x, y, tabId) {
+    editingCommentId = comment.id;
+    editingCommentTabId = tabId;
+    const popup = document.getElementById('comment-popup');
+    popup.querySelector('.comment-popup-page').textContent = `ページ ${comment.page_num}`;
+    document.getElementById('comment-text').value = comment.content || '';
+    popup.style.display = 'block';
+    popup.style.left = Math.min(x + 10, window.innerWidth - 280) + 'px';
+    popup.style.top = Math.min(y - 30, window.innerHeight - 200) + 'px';
+    document.getElementById('comment-text').focus();
+}
+
+function hideCommentPopup() {
+    document.getElementById('comment-popup').style.display = 'none';
+    editingCommentId = null;
+    editingCommentTabId = null;
+}
+
+async function saveComment() {
+    if (!editingCommentId) return;
+    const content = document.getElementById('comment-text').value;
+    await window.api.updateComment(editingCommentId, { content });
+
+    const state = pdfStates[editingCommentTabId];
+    if (state) {
+        const c = state.comments.find(c => c.id === editingCommentId);
+        if (c) c.content = content;
+        renderPdfPages(editingCommentTabId);
+    }
+    hideCommentPopup();
+}
+
+async function deleteComment() {
+    if (!editingCommentId) return;
+    await window.api.deleteComment(editingCommentId);
+
+    const state = pdfStates[editingCommentTabId];
+    if (state) {
+        state.comments = state.comments.filter(c => c.id !== editingCommentId);
+        renderPdfPages(editingCommentTabId);
+    }
+    hideCommentPopup();
+}
+
+// ── Viewer controls ──────────────────────────────────
+function viewerNav(delta) {
+    const state = pdfStates[activeTabId];
+    if (!state) return;
+
+    if (state.spreadMode) {
+        // In spread: page 1 alone, then pairs
+        let cur = state.currentPage;
+        if (delta > 0) {
+            cur = cur === 1 ? 2 : cur + 2;
+        } else {
+            cur = cur <= 2 ? 1 : cur - 2;
+        }
+        state.currentPage = Math.max(1, Math.min(cur, state.totalPages));
+    } else {
+        state.currentPage = Math.max(1, Math.min(state.currentPage + delta, state.totalPages));
+    }
+    renderPdfPages(activeTabId);
+}
+
+function viewerZoomIn() {
+    const state = pdfStates[activeTabId];
+    if (state) { state.scale = Math.min(state.scale * 1.2, 5.0); state.fitMode = false; renderPdfPages(activeTabId); }
+}
+function viewerZoomOut() {
+    const state = pdfStates[activeTabId];
+    if (state) { state.scale = Math.max(state.scale * 0.8, 0.3); state.fitMode = false; renderPdfPages(activeTabId); }
+}
+async function viewerFitWidth() {
+    const state = pdfStates[activeTabId];
+    if (!state || !state.pdfDoc) return;
+    const page = await state.pdfDoc.getPage(1);
+    const viewport = page.getViewport({ scale: 1.0 });
+    const container = document.getElementById('viewer-container');
+    let availW = container.clientWidth - 60;
+    if (state.spreadMode) availW = (availW - 4) / 2; // 2 pages side by side
+    state.scale = availW / viewport.width;
+    state.fitMode = true;
+    renderPdfPages(activeTabId);
+}
+
+function toggleSpreadMode() {
+    const state = pdfStates[activeTabId];
+    if (!state) return;
+    state.spreadMode = !state.spreadMode;
+    document.getElementById('btn-spread').classList.toggle('active', state.spreadMode);
+    if (state.fitMode) viewerFitWidth();
+    else renderPdfPages(activeTabId);
+}
+
+function toggleScrollDirection() {
+    const state = pdfStates[activeTabId];
+    if (!state) return;
+    state.scrollDir = state.scrollDir === 'vertical' ? 'horizontal' : 'vertical';
+    showPdfTab(activeTabId);
+}
+
+function toggleCommentMode() {
+    commentMode = !commentMode;
+    document.getElementById('btn-comment-mode').classList.toggle('active', commentMode);
+    document.getElementById('viewer-container').classList.toggle('comment-mode', commentMode);
+}
+
+function viewerToggleThumbnails() {
+    const state = pdfStates[activeTabId];
+    if (!state) return;
+    state.thumbnailsOpen = !state.thumbnailsOpen;
+    document.getElementById('viewer-sidebar').classList.toggle('open', state.thumbnailsOpen);
+    if (state.thumbnailsOpen) generateThumbnails(activeTabId);
+}
+
+async function generateThumbnails(tabId) {
+    const state = pdfStates[tabId];
+    if (!state || !state.pdfDoc) return;
+    const list = document.getElementById('thumbnail-list');
+    list.innerHTML = '';
+    const max = Math.min(state.totalPages, 200);
+    for (let i = 1; i <= max; i++) {
+        const item = document.createElement('div');
+        item.className = 'thumbnail-item' + (i === state.currentPage ? ' active' : '');
+        item.dataset.page = i;
+        const canvas = document.createElement('canvas');
+        canvas.className = 'thumbnail-canvas';
+        const label = document.createElement('span');
+        label.className = 'thumbnail-label';
+        label.textContent = i;
+        item.appendChild(canvas);
+        item.appendChild(label);
+        list.appendChild(item);
+        item.addEventListener('click', () => { state.currentPage = i; renderPdfPages(tabId); });
+    }
+    for (let i = 1; i <= max; i++) {
+        const canvas = list.children[i - 1]?.querySelector('canvas');
+        if (!canvas) continue;
+        try {
+            const page = await state.pdfDoc.getPage(i);
+            const vp = page.getViewport({ scale: 0.2 });
+            const dpr = window.devicePixelRatio || 1;
+            canvas.width = vp.width * dpr; canvas.height = vp.height * dpr;
+            canvas.style.width = vp.width + 'px'; canvas.style.height = vp.height + 'px';
+            const ctx = canvas.getContext('2d'); ctx.scale(dpr, dpr);
+            await page.render({ canvasContext: ctx, viewport: vp }).promise;
+        } catch (e) { /* skip */ }
+    }
+}
+
+function updateThumbnailHighlight(tabId) {
+    const state = pdfStates[tabId];
+    if (!state) return;
+    document.querySelectorAll('.thumbnail-item').forEach(item => {
+        item.classList.toggle('active', parseInt(item.dataset.page) === state.currentPage);
+    });
+    const active = document.querySelector('.thumbnail-item.active');
+    if (active) active.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+// ══════════════════════════════════════════════════════
+//  BOOKSHELF
+// ══════════════════════════════════════════════════════
+
+async function renderBooks() {
+    const grid = document.getElementById('book-grid');
+    const emptyState = document.getElementById('empty-state');
+    const countEl = document.getElementById('book-count');
+
+    let books = allBooks;
+    if (currentFilter === 'tag' && currentTagId) {
+        books = books.filter(b => b.tags.some(t => t.id === currentTagId));
+    }
+    const query = document.getElementById('search-input').value.trim().toLowerCase();
+    if (query) books = books.filter(b => b.title.toLowerCase().includes(query));
+
+    countEl.textContent = books.length > 0 ? `${books.length}冊` : '';
+
+    if (books.length === 0) {
+        grid.style.display = 'none';
+        emptyState.style.display = 'flex';
+        return;
+    }
+
+    grid.style.display = 'grid';
+    emptyState.style.display = 'none';
+
+    if (viewMode === 'stacks' && allTags.length > 0) {
+        await renderStacksView(grid, books);
+    } else {
+        await renderGridView(grid, books);
+    }
+}
+
+async function renderGridView(grid, books) {
+    const fragment = document.createDocumentFragment();
+    for (const book of books) {
+        fragment.appendChild(await createBookCard(book));
+    }
+    grid.innerHTML = '';
+    grid.appendChild(fragment);
+}
+
+async function renderStacksView(grid, books) {
+    grid.innerHTML = '';
+
+    // Group books by tags
+    const taggedGroups = {};
+    const untagged = [];
+
+    for (const book of books) {
+        if (book.tags.length === 0) { untagged.push(book); continue; }
+        const mainTag = book.tags[0];
+        if (!taggedGroups[mainTag.id]) taggedGroups[mainTag.id] = { tag: mainTag, books: [] };
+        taggedGroups[mainTag.id].books.push(book);
+    }
+
+    // Render each tag group as a stack
+    for (const group of Object.values(taggedGroups)) {
+        const stackEl = document.createElement('div');
+        stackEl.className = 'stack-group';
+        const isExpanded = stacksExpanded[group.tag.id] !== false; // Default expanded
+
+        const header = document.createElement('div');
+        header.className = 'stack-header' + (isExpanded ? '' : ' collapsed');
+        header.innerHTML = `
+      <svg class="stack-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+      <span class="stack-dot" style="background:${group.tag.color}"></span>
+      <span class="stack-name">${escapeHtml(group.tag.name)}</span>
+      <span class="stack-count">${group.books.length}冊</span>
+    `;
+        header.addEventListener('click', () => {
+            stacksExpanded[group.tag.id] = !isExpanded;
+            renderBooks();
+        });
+        stackEl.appendChild(header);
+
+        if (isExpanded) {
+            const cards = document.createElement('div');
+            cards.className = 'stack-cards';
+            for (const book of group.books) {
+                cards.appendChild(await createBookCard(book));
+            }
+            stackEl.appendChild(cards);
+        } else {
+            // Collapsed: show fanned preview
+            const preview = document.createElement('div');
+            preview.className = 'stack-collapsed-preview';
+            const previewBooks = group.books.slice(0, 3);
+            for (const book of previewBooks) {
+                const cover = document.createElement('div');
+                cover.className = 'stacked-cover';
+                if (book.cover_path) {
+                    const dataUrl = await window.api.getCoverData(book.cover_path);
+                    if (dataUrl) cover.innerHTML = `<img src="${dataUrl}" alt="">`;
+                }
+                preview.appendChild(cover);
+            }
+            const info = document.createElement('div');
+            info.className = 'stack-collapsed-info';
+            info.innerHTML = `<div class="stack-name">${escapeHtml(group.tag.name)}</div><div class="stack-count">${group.books.length}冊</div>`;
+            preview.appendChild(info);
+            preview.addEventListener('click', () => {
+                stacksExpanded[group.tag.id] = true;
+                renderBooks();
+            });
+            stackEl.appendChild(preview);
+        }
+
+        grid.appendChild(stackEl);
+    }
+
+    // Untagged books
+    if (untagged.length > 0) {
+        const stackEl = document.createElement('div');
+        stackEl.className = 'stack-group';
+        const isExpanded = stacksExpanded['untagged'] !== false;
+        const header = document.createElement('div');
+        header.className = 'stack-header' + (isExpanded ? '' : ' collapsed');
+        header.innerHTML = `
+      <svg class="stack-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+      <span class="stack-dot" style="background:#8e8e93"></span>
+      <span class="stack-name">タグなし</span>
+      <span class="stack-count">${untagged.length}冊</span>
+    `;
+        header.addEventListener('click', () => {
+            stacksExpanded['untagged'] = !isExpanded;
+            renderBooks();
+        });
+        stackEl.appendChild(header);
+
+        if (isExpanded) {
+            const cards = document.createElement('div');
+            cards.className = 'stack-cards';
+            for (const book of untagged) cards.appendChild(await createBookCard(book));
+            stackEl.appendChild(cards);
+        }
+
+        grid.appendChild(stackEl);
+    }
+}
+
+async function createBookCard(book) {
+    const card = document.createElement('div');
+    card.className = 'book-card';
+    card.dataset.id = book.id;
+
+    let coverHtml;
+    if (book.cover_path) {
+        const dataUrl = await window.api.getCoverData(book.cover_path);
+        coverHtml = dataUrl
+            ? `<img class="book-cover" src="${dataUrl}" alt="${escapeHtml(book.title)}" loading="lazy">`
+            : placeholderHtml(book.title);
+    } else {
+        coverHtml = placeholderHtml(book.title);
+    }
+
+    const tagsHtml = book.tags.map(t =>
+        `<span class="book-tag-badge" style="background:${t.color}">${escapeHtml(t.name)}</span>`
+    ).join('');
+
+    card.innerHTML = `
+    <div class="book-cover-wrapper">${coverHtml}</div>
+    <div class="book-info">
+      <div class="book-title">${escapeHtml(book.title)}</div>
+      ${tagsHtml ? `<div class="book-tags">${tagsHtml}</div>` : ''}
+    </div>
+  `;
+
+    card.addEventListener('click', () => openPdfTab(book.id));
+    card.addEventListener('contextmenu', (e) => {
+        e.preventDefault(); showContextMenu(e.clientX, e.clientY, book.id);
+    });
+    return card;
+}
+
+function placeholderHtml(title) {
+    return `<div class="book-cover-placeholder">
+    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+      <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+      <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+    </svg>
+    <span>${escapeHtml(title)}</span>
+  </div>`;
+}
+
+// ── Tags ─────────────────────────────────────────────
+function renderTags() {
+    const list = document.getElementById('tag-list');
+    list.innerHTML = '';
+    for (const tag of allTags) {
+        const btn = document.createElement('button');
+        btn.className = 'tag-item' + (currentFilter === 'tag' && currentTagId === tag.id ? ' active' : '');
+        btn.innerHTML = `
+      <span class="tag-dot" style="background:${tag.color}"></span>
+      <span>${escapeHtml(tag.name)}</span>
+      <span class="tag-item-actions">
+        <button class="tag-action-btn" data-tag-action="edit" data-tag-id="${tag.id}" title="編集">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+        </button>
+        <button class="tag-action-btn" data-tag-action="delete" data-tag-id="${tag.id}" title="削除">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+        </button>
+      </span>
+    `;
+        btn.addEventListener('click', (e) => {
+            if (e.target.closest('[data-tag-action]')) return;
+            setFilter('tag', tag.id, tag.name);
+        });
+        list.appendChild(btn);
+    }
+    list.querySelectorAll('[data-tag-action]').forEach(btn => {
+        btn.addEventListener('click', async (e) => {
+            e.stopPropagation();
+            const tagId = parseInt(btn.dataset.tagId);
+            if (btn.dataset.tagAction === 'edit') openTagModal(allTags.find(t => t.id === tagId));
+            else if (btn.dataset.tagAction === 'delete') {
+                await window.api.deleteTag(tagId);
+                await loadData(); renderTags();
+                if (currentTagId === tagId) setFilter('all'); else renderBooks();
+            }
+        });
+    });
+}
+
+function setFilter(type, tagId = null, tagName = '') {
+    currentFilter = type;
+    currentTagId = tagId;
+    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+    document.querySelectorAll('.tag-item').forEach(n => n.classList.remove('active'));
+    const titleEl = document.getElementById('view-title');
+    if (type === 'all') { document.getElementById('nav-all').classList.add('active'); titleEl.textContent = 'すべての本'; }
+    else if (type === 'recent') { document.getElementById('nav-recent').classList.add('active'); titleEl.textContent = '最近追加'; }
+    else if (type === 'tag') {
+        titleEl.textContent = tagName;
+        document.querySelectorAll('.tag-item').forEach(btn => {
+            const dot = btn.querySelector('.tag-dot');
+            if (dot && btn.textContent.includes(tagName)) btn.classList.add('active');
+        });
+    }
+    renderBooks();
+}
+
+// ══════════════════════════════════════════════════════
+//  EVENT LISTENERS
+// ══════════════════════════════════════════════════════
+
+function setupEventListeners() {
+    document.getElementById('tab-bookshelf').addEventListener('click', () => activateTab('bookshelf'));
+    document.getElementById('btn-add-books').addEventListener('click', addBooks);
+    window.api.onMenuAddBooks(addBooks);
+    window.api.onMenuCloseTab(() => { if (activeTabId !== 'bookshelf') closeTab(activeTabId); });
+
+    let searchTimeout;
+    document.getElementById('search-input').addEventListener('input', () => {
+        clearTimeout(searchTimeout); searchTimeout = setTimeout(renderBooks, 200);
+    });
+
+    document.getElementById('nav-all').addEventListener('click', () => setFilter('all'));
+    document.getElementById('nav-recent').addEventListener('click', () => setFilter('recent'));
+    document.getElementById('btn-add-tag').addEventListener('click', () => openTagModal());
+
+    // View mode toggle
+    document.getElementById('btn-view-grid').addEventListener('click', () => {
+        viewMode = 'grid';
+        document.getElementById('btn-view-grid').classList.add('active');
+        document.getElementById('btn-view-stacks').classList.remove('active');
+        renderBooks();
+    });
+    document.getElementById('btn-view-stacks').addEventListener('click', () => {
+        viewMode = 'stacks';
+        document.getElementById('btn-view-stacks').classList.add('active');
+        document.getElementById('btn-view-grid').classList.remove('active');
+        renderBooks();
+    });
+
+    // Drag and drop
+    const main = document.getElementById('main-content');
+    const dropOverlay = document.getElementById('drop-overlay');
+    let dragCounter = 0;
+    main.addEventListener('dragenter', (e) => { e.preventDefault(); dragCounter++; dropOverlay.classList.add('active'); });
+    main.addEventListener('dragleave', (e) => { e.preventDefault(); dragCounter--; if (dragCounter <= 0) { dragCounter = 0; dropOverlay.classList.remove('active'); } });
+    main.addEventListener('dragover', (e) => e.preventDefault());
+    main.addEventListener('drop', async (e) => {
+        e.preventDefault(); dragCounter = 0; dropOverlay.classList.remove('active');
+        const files = [...e.dataTransfer.files].filter(f => f.name.toLowerCase().endsWith('.pdf'));
+        if (files.length > 0) await importFiles(files.map(f => f.path));
+    });
+
+    document.addEventListener('click', (e) => {
+        hideContextMenu(); hideTabContextMenu();
+        if (!e.target.closest('#comment-popup') && !e.target.closest('.comment-marker')) hideCommentPopup();
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') { hideContextMenu(); hideTabContextMenu(); hideCommentPopup(); closeAllModals(); }
+    });
+
+    document.querySelectorAll('#context-menu button').forEach(btn => {
+        btn.addEventListener('click', () => handleContextAction(btn.dataset.action));
+    });
+
+    // Tag modal
+    document.getElementById('tag-modal-close').addEventListener('click', closeAllModals);
+    document.getElementById('tag-modal-cancel').addEventListener('click', closeAllModals);
+    document.getElementById('tag-modal-save').addEventListener('click', saveTag);
+    document.getElementById('tag-assign-close').addEventListener('click', closeAllModals);
+    document.getElementById('tag-assign-done').addEventListener('click', async () => { closeAllModals(); await loadData(); renderBooks(); });
+    document.getElementById('rename-modal-close').addEventListener('click', closeAllModals);
+    document.getElementById('rename-cancel').addEventListener('click', closeAllModals);
+    document.getElementById('rename-save').addEventListener('click', saveRename);
+    document.getElementById('rename-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') saveRename(); });
+
+    // Groups
+    document.getElementById('btn-new-group').addEventListener('click', () => openGroupModal());
+    document.getElementById('group-modal-close').addEventListener('click', closeAllModals);
+    document.getElementById('group-modal-cancel').addEventListener('click', closeAllModals);
+    document.getElementById('group-modal-save').addEventListener('click', saveGroup);
+    document.getElementById('move-group-close').addEventListener('click', closeAllModals);
+
+    document.querySelectorAll('#tab-context-menu button').forEach(btn => {
+        btn.addEventListener('click', () => handleTabContextAction(btn.dataset.action));
+    });
+
+    // ── PDF viewer controls ──
+    document.getElementById('btn-prev').addEventListener('click', () => viewerNav(-1));
+    document.getElementById('btn-next').addEventListener('click', () => viewerNav(1));
+    document.getElementById('btn-zoom-in').addEventListener('click', viewerZoomIn);
+    document.getElementById('btn-zoom-out').addEventListener('click', viewerZoomOut);
+    document.getElementById('btn-fit').addEventListener('click', viewerFitWidth);
+    document.getElementById('btn-spread').addEventListener('click', toggleSpreadMode);
+    document.getElementById('btn-scroll-dir').addEventListener('click', toggleScrollDirection);
+    document.getElementById('btn-comment-mode').addEventListener('click', toggleCommentMode);
+    document.getElementById('btn-thumbnails').addEventListener('click', viewerToggleThumbnails);
+
+    // Comment popup
+    document.getElementById('comment-save').addEventListener('click', saveComment);
+    document.getElementById('comment-cancel').addEventListener('click', hideCommentPopup);
+    document.getElementById('comment-delete').addEventListener('click', deleteComment);
+
+    const pageInput = document.getElementById('page-input');
+    pageInput.addEventListener('change', () => {
+        const state = pdfStates[activeTabId];
+        if (!state) return;
+        const num = parseInt(pageInput.value);
+        if (num >= 1 && num <= state.totalPages) { state.currentPage = num; renderPdfPages(activeTabId); }
+        else pageInput.value = state.currentPage;
+    });
+    pageInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') pageInput.blur(); });
+
+    // Keyboard
+    document.addEventListener('keydown', (e) => {
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+        if (activeTabId === 'bookshelf') return;
+
+        const state = pdfStates[activeTabId];
+        if (!state) return;
+
+        if (state.scrollDir === 'horizontal') {
+            switch (e.key) {
+                case 'ArrowLeft': e.preventDefault(); viewerNav(-1); break;
+                case 'ArrowRight': e.preventDefault(); viewerNav(1); break;
+                case 'ArrowUp': e.preventDefault(); viewerZoomIn(); break;
+                case 'ArrowDown': e.preventDefault(); viewerZoomOut(); break;
+            }
+        } else {
+            switch (e.key) {
+                case 'ArrowLeft': e.preventDefault(); viewerNav(-1); break;
+                case 'ArrowRight': e.preventDefault(); viewerNav(1); break;
+                case 'ArrowUp': e.preventDefault(); viewerNav(-1); break;
+                case 'ArrowDown': e.preventDefault(); viewerNav(1); break;
+            }
+        }
+
+        if (e.key === ' ') { e.preventDefault(); viewerNav(e.shiftKey ? -1 : 1); }
+        if ((e.metaKey || e.ctrlKey) && e.key === '=') { e.preventDefault(); viewerZoomIn(); }
+        if ((e.metaKey || e.ctrlKey) && e.key === '-') { e.preventDefault(); viewerZoomOut(); }
+        if ((e.metaKey || e.ctrlKey) && e.key === '0') { e.preventDefault(); viewerFitWidth(); }
+    });
+
+    // Resize
+    let resizeTimeout;
+    window.addEventListener('resize', () => {
+        clearTimeout(resizeTimeout);
+        resizeTimeout = setTimeout(() => {
+            const state = pdfStates[activeTabId];
+            if (state && state.fitMode && state.loaded) viewerFitWidth();
+        }, 200);
+    });
+}
+
+// ── Add / Import Books ───────────────────────────────
+async function addBooks() {
+    const files = await window.api.selectPdfFiles();
+    if (files && files.length > 0) await importFiles(files);
+}
+
+async function importFiles(filePaths) {
+    const overlay = document.createElement('div');
+    overlay.className = 'import-overlay';
+    overlay.innerHTML = `<div class="import-progress"><div class="loading-spinner-sm"></div><p id="import-status">インポート中… (0/${filePaths.length})</p></div>`;
+    document.body.appendChild(overlay);
+    for (let i = 0; i < filePaths.length; i++) {
+        document.getElementById('import-status').textContent = `インポート中… (${i + 1}/${filePaths.length})`;
+        try { await window.api.importPdf(filePaths[i]); } catch (e) { console.error('Import failed:', filePaths[i], e); }
+    }
+    overlay.remove();
+    await loadData(); renderBooks();
+}
+
+// ── Context Menu (books) ─────────────────────────────
+function showContextMenu(x, y, bookId) {
+    contextBookId = bookId;
+    const menu = document.getElementById('context-menu');
+    menu.style.display = 'block';
+    menu.style.left = Math.min(x, window.innerWidth - 220) + 'px';
+    menu.style.top = Math.min(y, window.innerHeight - 250) + 'px';
+}
+function hideContextMenu() { document.getElementById('context-menu').style.display = 'none'; }
+
+async function handleContextAction(action) {
+    hideContextMenu();
+    if (!contextBookId) return;
+    switch (action) {
+        case 'open': openPdfTab(contextBookId); break;
+        case 'rename': openRenameModal(contextBookId); break;
+        case 'set-cover': {
+            const imagePath = await window.api.selectCoverImage();
+            if (imagePath) { await window.api.setCustomCover(contextBookId, imagePath); await loadData(); renderBooks(); }
+            break;
+        }
+        case 'manage-tags': openTagAssignModal(contextBookId); break;
+        case 'show-in-finder': {
+            const book = allBooks.find(b => b.id === contextBookId);
+            if (book) window.api.showInFinder(book.file_path);
+            break;
+        }
+        case 'delete': {
+            await window.api.removeBook(contextBookId);
+            const tab = tabs.find(t => t.bookId === contextBookId);
+            if (tab) closeTab(tab.id);
+            await loadData(); renderBooks();
+            break;
+        }
+    }
+}
+
+// ── Tab Context Menu ─────────────────────────────────
+let contextTabId = null;
+function showTabContextMenu(x, y, tabId) {
+    contextTabId = tabId;
+    const menu = document.getElementById('tab-context-menu');
+    menu.style.display = 'block';
+    menu.style.left = Math.min(x, window.innerWidth - 220) + 'px';
+    menu.style.top = Math.min(y, window.innerHeight - 200) + 'px';
+}
+function hideTabContextMenu() { document.getElementById('tab-context-menu').style.display = 'none'; }
+
+function handleTabContextAction(action) {
+    hideTabContextMenu();
+    if (!contextTabId) return;
+    switch (action) {
+        case 'close-tab': closeTab(contextTabId); break;
+        case 'close-other-tabs': tabs.filter(t => t.id !== contextTabId).map(t => t.id).forEach(id => closeTab(id)); break;
+        case 'move-to-group': openMoveToGroupModal(contextTabId); break;
+        case 'remove-from-group': {
+            const tab = tabs.find(t => t.id === contextTabId);
+            if (tab) { tab.groupId = null; renderTabBar(); }
+            break;
+        }
+    }
+}
+
+// ══════════════════════════════════════════════════════
+//  MODALS
+// ══════════════════════════════════════════════════════
+
+let editingTagId = null;
+let selectedTagColor = TAG_COLORS[0];
+
+function openTagModal(tag = null) {
+    editingTagId = tag ? tag.id : null;
+    selectedTagColor = tag ? tag.color : TAG_COLORS[0];
+    document.getElementById('tag-modal-title').textContent = tag ? 'タグを編集' : 'タグを追加';
+    document.getElementById('tag-name-input').value = tag ? tag.name : '';
+    renderColorPalette('color-palette', selectedTagColor, (c) => selectedTagColor = c);
+    document.getElementById('tag-modal').style.display = 'flex';
+    document.getElementById('tag-name-input').focus();
+}
+
+async function saveTag() {
+    const name = document.getElementById('tag-name-input').value.trim();
+    if (!name) return;
+    if (editingTagId) await window.api.updateTag(editingTagId, { name, color: selectedTagColor });
+    else await window.api.addTag(name, selectedTagColor);
+    closeAllModals(); await loadData(); renderTags(); renderBooks();
+}
+
+function openTagAssignModal(bookId) {
+    const book = allBooks.find(b => b.id === bookId);
+    if (!book) return;
+    const list = document.getElementById('tag-assign-list');
+    list.innerHTML = '';
+    for (const tag of allTags) {
+        const isAssigned = book.tags.some(t => t.id === tag.id);
+        const item = document.createElement('div');
+        item.className = 'tag-assign-item';
+        item.innerHTML = `
+      <div class="tag-assign-checkbox ${isAssigned ? 'checked' : ''}"></div>
+      <span class="tag-dot" style="background:${tag.color}"></span>
+      <span class="tag-assign-name">${escapeHtml(tag.name)}</span>
+    `;
+        item.addEventListener('click', async () => {
+            const checkbox = item.querySelector('.tag-assign-checkbox');
+            const checked = checkbox.classList.toggle('checked');
+            if (checked) await window.api.assignTag(bookId, tag.id);
+            else await window.api.unassignTag(bookId, tag.id);
+        });
+        list.appendChild(item);
+    }
+    document.getElementById('tag-assign-modal').style.display = 'flex';
+}
+
+let renamingBookId = null;
+function openRenameModal(bookId) {
+    renamingBookId = bookId;
+    const book = allBooks.find(b => b.id === bookId);
+    if (!book) return;
+    document.getElementById('rename-input').value = book.title;
+    document.getElementById('rename-modal').style.display = 'flex';
+    const input = document.getElementById('rename-input');
+    input.focus(); input.select();
+}
+
+async function saveRename() {
+    const title = document.getElementById('rename-input').value.trim();
+    if (!title || !renamingBookId) return;
+    await window.api.updateBook(renamingBookId, { title });
+    closeAllModals(); await loadData(); renderBooks();
+    const tab = tabs.find(t => t.bookId === renamingBookId);
+    if (tab) { tab.title = title; renderTabBar(); }
+}
+
+let editingGroupId = null;
+let selectedGroupColor = TAG_COLORS[0];
+
+function openGroupModal(group = null) {
+    editingGroupId = group ? group.id : null;
+    selectedGroupColor = group ? group.color : TAG_COLORS[0];
+    document.getElementById('group-modal-title').textContent = group ? 'グループを編集' : '新しいグループ';
+    document.getElementById('group-name-input').value = group ? group.name : '';
+    renderColorPalette('group-color-palette', selectedGroupColor, (c) => selectedGroupColor = c);
+    document.getElementById('group-modal').style.display = 'flex';
+    document.getElementById('group-name-input').focus();
+}
+
+function saveGroup() {
+    const name = document.getElementById('group-name-input').value.trim();
+    if (!name) return;
+    if (editingGroupId) {
+        const group = tabGroups.find(g => g.id === editingGroupId);
+        if (group) { group.name = name; group.color = selectedGroupColor; }
+    } else {
+        tabGroups.push({ id: nextGroupId++, name, color: selectedGroupColor, collapsed: false });
+    }
+    closeAllModals(); renderTabBar();
+}
+
+function openMoveToGroupModal(tabId) {
+    const body = document.getElementById('move-group-list');
+    body.innerHTML = '';
+    for (const group of tabGroups) {
+        const item = document.createElement('div');
+        item.className = 'move-group-item';
+        item.innerHTML = `<span class="tag-dot" style="background:${group.color}"></span> ${escapeHtml(group.name)}`;
+        item.addEventListener('click', () => {
+            const tab = tabs.find(t => t.id === tabId);
+            if (tab) { tab.groupId = group.id; renderTabBar(); }
+            closeAllModals();
+        });
+        body.appendChild(item);
+    }
+    if (tabGroups.length === 0) {
+        body.innerHTML = '<p style="color: var(--text-tertiary); font-size: 13px; padding: 8px;">まずグループを作成してください</p>';
+    }
+    document.getElementById('move-group-modal').style.display = 'flex';
+}
+
+function renderColorPalette(elementId, selectedColor, onSelect) {
+    const palette = document.getElementById(elementId);
+    palette.innerHTML = TAG_COLORS.map(c =>
+        `<div class="color-swatch ${c === selectedColor ? 'selected' : ''}" style="background:${c}" data-color="${c}"></div>`
+    ).join('');
+    palette.querySelectorAll('.color-swatch').forEach(swatch => {
+        swatch.addEventListener('click', () => {
+            palette.querySelectorAll('.color-swatch').forEach(s => s.classList.remove('selected'));
+            swatch.classList.add('selected');
+            onSelect(swatch.dataset.color);
+        });
+    });
+}
+
+function closeAllModals() { document.querySelectorAll('.modal-overlay').forEach(m => m.style.display = 'none'); }
+
+function escapeHtml(str) {
+    const div = document.createElement('div');
+    div.textContent = str;
+    return div.innerHTML;
+}

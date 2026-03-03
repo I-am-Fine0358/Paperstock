@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="ja">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Paperstock — Viewer</title>
+    <link rel="stylesheet" href="css/viewer.css">
+    <link
+        href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@300;400;500;600&family=Inter:wght@300;400;500;600&display=swap"
+        rel="stylesheet">
+</head>
+
+<body>
+    <!-- ─── Toolbar ─── -->
+    <div class="viewer-toolbar" id="viewer-toolbar">
+        <div class="toolbar-section toolbar-left">
+            <button class="tool-btn" id="btn-back" title="本棚に戻る">
+                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="15 18 9 12 15 6" />
+                </svg>
+            </button>
+            <span class="viewer-title" id="viewer-title"></span>
+        </div>
+
+        <div class="toolbar-section toolbar-center">
+            <button class="tool-btn" id="btn-prev" title="前のページ">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="15 18 9 12 15 6" />
+                </svg>
+            </button>
+            <div class="page-indicator">
+                <input type="number" id="page-input" min="1" value="1">
+                <span>/</span>
+                <span id="page-total">0</span>
+            </div>
+            <button class="tool-btn" id="btn-next" title="次のページ">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <polyline points="9 18 15 12 9 6" />
+                </svg>
+            </button>
+        </div>
+
+        <div class="toolbar-section toolbar-right">
+            <button class="tool-btn" id="btn-zoom-out" title="縮小">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="11" cy="11" r="8" />
+                    <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                    <line x1="8" y1="11" x2="14" y2="11" />
+                </svg>
+            </button>
+            <span class="zoom-level" id="zoom-level">100%</span>
+            <button class="tool-btn" id="btn-zoom-in" title="拡大">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <circle cx="11" cy="11" r="8" />
+                    <line x1="21" y1="21" x2="16.65" y2="16.65" />
+                    <line x1="11" y1="8" x2="11" y2="14" />
+                    <line x1="8" y1="11" x2="14" y2="11" />
+                </svg>
+            </button>
+            <button class="tool-btn" id="btn-fit" title="幅に合わせる">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <path
+                        d="M8 3H5a2 2 0 0 0-2 2v3m18 0V5a2 2 0 0 0-2-2h-3m0 18h3a2 2 0 0 0 2-2v-3M3 16v3a2 2 0 0 0 2 2h3" />
+                </svg>
+            </button>
+            <div class="toolbar-divider"></div>
+            <button class="tool-btn" id="btn-sidebar" title="サムネイル">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                    <rect x="3" y="3" width="7" height="7" />
+                    <rect x="14" y="3" width="7" height="7" />
+                    <rect x="3" y="14" width="7" height="7" />
+                    <rect x="14" y="14" width="7" height="7" />
+                </svg>
+            </button>
+        </div>
+    </div>
+
+    <!-- ─── Sidebar (Thumbnails) ─── -->
+    <aside class="viewer-sidebar" id="viewer-sidebar">
+        <div class="sidebar-content" id="thumbnail-list"></div>
+    </aside>
+
+    <!-- ─── Main Viewer ─── -->
+    <div class="viewer-container" id="viewer-container">
+        <div class="viewer-pages" id="viewer-pages">
+            <!-- Pages rendered here -->
+        </div>
+    </div>
+
+    <!-- ─── Loading ─── -->
+    <div class="viewer-loading" id="viewer-loading">
+        <div class="loading-spinner-viewer"></div>
+        <p>PDFを読み込み中…</p>
+    </div>
+
+    <script src="js/viewer.js"></script>
+</body>
+
+</html>
