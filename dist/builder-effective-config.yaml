@@ -1,0 +1,31 @@
+directories:
+  output: dist
+  buildResources: build
+appId: com.paperstock.app
+productName: Paperstock
+mac:
+  target:
+    - dmg
+  category: public.app-category.productivity
+  icon: build/icon.icns
+files:
+  - filter:
+      - main.js
+      - preload.js
+      - lib/**/*
+      - src/**/*
+      - node_modules/**/*
+      - '!node_modules/**/*.map'
+      - '!node_modules/**/*.md'
+      - '!node_modules/**/test/**'
+      - '!node_modules/**/docs/**'
+dmg:
+  title: Paperstock
+  contents:
+    - x: 130
+      'y': 220
+    - x: 410
+      'y': 220
+      type: link
+      path: /Applications
+electronVersion: 40.6.1
