@@ -1649,3 +1649,144 @@ body {
 .view-mode-btn:hover:not(.active) {
   color: var(--text-secondary);
 }
+
+/* Status Badge */
+.status-badge {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 6px;
+  border-radius: 8px;
+  font-weight: 600;
+  backdrop-filter: blur(8px);
+  z-index: 2;
+  pointer-events: none;
+}
+
+.status-badge.reading {
+  background: rgba(255, 149, 0, 0.85);
+  color: white;
+}
+
+.status-badge.completed {
+  background: rgba(52, 199, 89, 0.85);
+  color: white;
+}
+
+/* Context submenu */
+.context-submenu {
+  padding: 0 4px;
+}
+
+.context-submenu-label {
+  display: block;
+  font-size: 10px;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 4px 12px 2px;
+  font-weight: 600;
+}
+
+.context-submenu button {
+  font-size: 12px;
+  padding: 4px 12px;
+}
+
+.context-submenu button.active-status {
+  font-weight: 700;
+  color: var(--accent);
+}
+
+/* Bookmark button group */
+.bookmark-btn-wrap {
+  display: flex;
+  align-items: center;
+  gap: 0;
+}
+
+.bookmark-btn-wrap .tool-btn-sm {
+  margin-left: -4px;
+}
+
+/* Bookmark dropdown */
+.bookmark-dropdown {
+  position: fixed;
+  min-width: 220px;
+  max-height: 320px;
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+  z-index: 2000;
+  overflow: hidden;
+}
+
+.bookmark-dropdown-header {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 10px 14px 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.bookmark-list {
+  overflow-y: auto;
+  max-height: 260px;
+}
+
+.bookmark-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  cursor: pointer;
+  transition: background var(--transition);
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
+.bookmark-item:hover {
+  background: var(--bg-hover);
+}
+
+.bookmark-item .bookmark-page {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent);
+  min-width: 36px;
+}
+
+.bookmark-item .bookmark-label {
+  flex: 1;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bookmark-item .bookmark-delete {
+  border: none;
+  background: none;
+  color: var(--text-tertiary);
+  cursor: pointer;
+  font-size: 14px;
+  padding: 2px;
+  opacity: 0;
+  transition: opacity var(--transition);
+}
+
+.bookmark-item:hover .bookmark-delete {
+  opacity: 1;
+}
+
+.bookmark-empty {
+  padding: 16px;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}

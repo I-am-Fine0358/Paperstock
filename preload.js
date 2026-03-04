@@ -38,6 +38,11 @@ contextBridge.exposeInMainWorld('api', {
     updateComment: (id, data) => ipcRenderer.invoke('update-comment', id, data),
     deleteComment: (id) => ipcRenderer.invoke('delete-comment', id),
 
+    // Bookmarks
+    addBookmark: (data) => ipcRenderer.invoke('add-bookmark', data),
+    getBookmarks: (bookId) => ipcRenderer.invoke('get-bookmarks', bookId),
+    deleteBookmark: (id) => ipcRenderer.invoke('delete-bookmark', id),
+
     // Menu events
     onMenuAddBooks: (callback) => ipcRenderer.on('menu-add-books', callback),
     onMenuCloseTab: (callback) => ipcRenderer.on('menu-close-tab', callback),

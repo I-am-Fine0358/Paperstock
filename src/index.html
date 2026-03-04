@@ -202,6 +202,19 @@
             </svg>
           </button>
           <div class="vtoolbar-divider"></div>
+          <!-- Bookmark -->
+          <div class="bookmark-btn-wrap">
+            <button class="tool-btn" id="btn-bookmark" title="栖を挿む">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z" />
+              </svg>
+            </button>
+            <button class="tool-btn tool-btn-sm" id="btn-bookmark-list" title="栖一覧">
+              <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <polyline points="6 9 12 15 18 9" />
+              </svg>
+            </button>
+          </div>
           <!-- Comment mode -->
           <button class="tool-btn" id="btn-comment-mode" title="コメントモード">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -256,11 +269,25 @@
     <button data-action="open">開く</button>
     <button data-action="rename">名前を変更</button>
     <hr>
+    <div class="context-submenu">
+      <span class="context-submenu-label">ステータス</span>
+      <button data-action="status-unread">○ 未読</button>
+      <button data-action="status-reading">📖 読書中</button>
+      <button data-action="status-completed">✅ 読了</button>
+    </div>
+    <hr>
     <button data-action="set-cover">カバー画像を変更…</button>
     <button data-action="manage-tags">タグを編集…</button>
     <hr>
     <button data-action="show-in-finder">Finderで表示</button>
     <button data-action="delete" class="danger">ライブラリから削除</button>
+  </div>
+
+  <!-- ═══ Bookmark Dropdown ═══ -->
+  <div id="bookmark-dropdown" class="bookmark-dropdown" style="display:none;">
+    <div class="bookmark-dropdown-header">栖 一覧</div>
+    <div id="bookmark-list" class="bookmark-list"></div>
+    <div class="bookmark-empty" id="bookmark-empty">栖がありません</div>
   </div>
 
   <!-- ═══ Tab Context Menu ═══ -->
