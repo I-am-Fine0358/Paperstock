@@ -208,6 +208,11 @@ ipcMain.handle('get-page-comments', (_, bookId, pageNum) => db.getCommentsForPag
 ipcMain.handle('update-comment', (_, id, data) => db.updateComment(id, data));
 ipcMain.handle('delete-comment', (_, id) => db.deleteComment(id));
 
+// Bookmarks
+ipcMain.handle('add-bookmark', (_, data) => db.addBookmark(data));
+ipcMain.handle('get-bookmarks', (_, bookId) => db.getBookmarks(bookId));
+ipcMain.handle('delete-bookmark', (_, id) => db.deleteBookmark(id));
+
 // ── App Lifecycle ────────────────────────────────────
 app.whenReady().then(() => {
     db = new BookDatabase(dbPath);

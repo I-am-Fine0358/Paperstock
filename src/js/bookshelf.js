@@ -78,6 +78,13 @@ function openPdfTab(bookId) {
     const book = allBooks.find(b => b.id === bookId);
     if (!book) return;
 
+    // Auto-set status to reading
+    if (book.status === 'unread') {
+        window.api.updateBook(bookId, { status: 'reading' });
+        book.status = 'reading';
+        renderBooks();
+    }
+
     const tabId = 'pdf-' + nextTabId++;
     tabs.push({ id: tabId, type: 'pdf', bookId, title: book.title, groupId: null });
     activateTab(tabId);
@@ -253,6 +260,7 @@ async function loadPdfForTab(tabId, book) {
         spreadMode: false,
         scrollDir: 'vertical', // 'vertical' | 'horizontal'
         comments: [],
+        bookmarks: [],
     };
 
     if (activeTabId === tabId) {
@@ -274,8 +282,9 @@ async function loadPdfForTab(tabId, book) {
         state.totalPages = doc.numPages;
         state.loaded = true;
 
-        // Load comments
+        // Load comments & bookmarks
         state.comments = await window.api.getComments(book.id);
+        state.bookmarks = await window.api.getBookmarks(book.id);
 
         // Calculate fit-width scale
         const page = await doc.getPage(1);
@@ -344,6 +353,7 @@ async function renderPdfPages(tabId) {
     document.getElementById('viewer-container').scrollTop = 0;
     document.getElementById('viewer-container').scrollLeft = 0;
     updateThumbnailHighlight(tabId);
+    updateBookmarkButton();
 }
 
 async function renderSinglePage(tabId, container, state) {
@@ -736,6 +746,9 @@ async function renderStacksView(grid, books) {
         if (isExpanded) {
             const cards = document.createElement('div');
             cards.className = 'stack-cards';
+            cards.style.display = 'grid';
+            cards.style.gridTemplateColumns = `repeat(auto-fill, minmax(${bookshelfCardSize}px, 1fr))`;
+            cards.style.gap = '20px';
             for (const book of group.books) {
                 cards.appendChild(await createBookCard(book));
             }
@@ -790,6 +803,9 @@ async function renderStacksView(grid, books) {
         if (isExpanded) {
             const cards = document.createElement('div');
             cards.className = 'stack-cards';
+            cards.style.display = 'grid';
+            cards.style.gridTemplateColumns = `repeat(auto-fill, minmax(${bookshelfCardSize}px, 1fr))`;
+            cards.style.gap = '20px';
             for (const book of untagged) cards.appendChild(await createBookCard(book));
             stackEl.appendChild(cards);
         }
@@ -817,8 +833,12 @@ async function createBookCard(book) {
         `<span class="book-tag-badge" style="background:${t.color}">${escapeHtml(t.name)}</span>`
     ).join('');
 
+    let statusHtml = '';
+    if (book.status === 'reading') statusHtml = '<div class="status-badge reading">読書中</div>';
+    else if (book.status === 'completed') statusHtml = '<div class="status-badge completed">読了</div>';
+
     card.innerHTML = `
-    <div class="book-cover-wrapper">${coverHtml}</div>
+    <div class="book-cover-wrapper">${coverHtml}${statusHtml}</div>
     <div class="book-info">
       <div class="book-title">${escapeHtml(book.title)}</div>
       ${tagsHtml ? `<div class="book-tags">${tagsHtml}</div>` : ''}
@@ -948,6 +968,7 @@ function setupEventListeners() {
     document.addEventListener('click', (e) => {
         hideContextMenu(); hideTabContextMenu();
         if (!e.target.closest('#comment-popup') && !e.target.closest('.comment-marker')) hideCommentPopup();
+        if (!e.target.closest('#bookmark-dropdown') && !e.target.closest('.bookmark-btn-wrap')) hideBookmarkDropdown();
     });
     document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') { hideContextMenu(); hideTabContextMenu(); hideCommentPopup(); closeAllModals(); }
@@ -1021,6 +1042,10 @@ function setupEventListeners() {
     document.getElementById('comment-save').addEventListener('click', saveComment);
     document.getElementById('comment-cancel').addEventListener('click', hideCommentPopup);
     document.getElementById('comment-delete').addEventListener('click', deleteComment);
+
+    // Bookmarks
+    document.getElementById('btn-bookmark').addEventListener('click', toggleBookmark);
+    document.getElementById('btn-bookmark-list').addEventListener('click', showBookmarkDropdown);
 
     const pageInput = document.getElementById('page-input');
     pageInput.addEventListener('change', () => {
@@ -1102,9 +1127,92 @@ function showContextMenu(x, y, bookId) {
     const menu = document.getElementById('context-menu');
     menu.style.display = 'block';
     menu.style.left = Math.min(x, window.innerWidth - 220) + 'px';
-    menu.style.top = Math.min(y, window.innerHeight - 250) + 'px';
+    menu.style.top = Math.min(y, window.innerHeight - 300) + 'px';
+    // Highlight current status
+    const book = allBooks.find(b => b.id === bookId);
+    const status = book ? (book.status || 'unread') : 'unread';
+    menu.querySelectorAll('.context-submenu button').forEach(btn => {
+        const act = btn.dataset.action;
+        btn.classList.toggle('active-status', act === 'status-' + status);
+    });
 }
 function hideContextMenu() { document.getElementById('context-menu').style.display = 'none'; }
+
+// ── Bookmarks ────────────────────────────────────────
+async function toggleBookmark() {
+    const state = pdfStates[activeTabId];
+    if (!state) return;
+    const existing = state.bookmarks.find(b => b.page_num === state.currentPage);
+    if (existing) {
+        await window.api.deleteBookmark(existing.id);
+        state.bookmarks = state.bookmarks.filter(b => b.id !== existing.id);
+    } else {
+        const bm = await window.api.addBookmark({ bookId: state.bookId, pageNum: state.currentPage, label: '' });
+        state.bookmarks.push(bm);
+    }
+    updateBookmarkButton();
+}
+
+function updateBookmarkButton() {
+    const state = pdfStates[activeTabId];
+    if (!state) return;
+    const btn = document.getElementById('btn-bookmark');
+    const isBookmarked = state.bookmarks.some(b => b.page_num === state.currentPage);
+    btn.classList.toggle('active', isBookmarked);
+    if (isBookmarked) {
+        btn.querySelector('svg').setAttribute('fill', 'currentColor');
+    } else {
+        btn.querySelector('svg').setAttribute('fill', 'none');
+    }
+}
+
+function showBookmarkDropdown() {
+    const state = pdfStates[activeTabId];
+    if (!state) return;
+    const dropdown = document.getElementById('bookmark-dropdown');
+    const list = document.getElementById('bookmark-list');
+    const empty = document.getElementById('bookmark-empty');
+    list.innerHTML = '';
+
+    if (state.bookmarks.length === 0) {
+        empty.style.display = 'block';
+    } else {
+        empty.style.display = 'none';
+        for (const bm of state.bookmarks) {
+            const item = document.createElement('div');
+            item.className = 'bookmark-item';
+            item.innerHTML = `
+                <span class="bookmark-page">P.${bm.page_num}</span>
+                <span class="bookmark-label">${bm.label || '\u6816'}</span>
+                <button class="bookmark-delete" title="\u524a\u9664">\u00d7</button>
+            `;
+            item.addEventListener('click', (e) => {
+                if (e.target.closest('.bookmark-delete')) return;
+                state.currentPage = bm.page_num;
+                renderPdfPages(activeTabId);
+                hideBookmarkDropdown();
+            });
+            item.querySelector('.bookmark-delete').addEventListener('click', async (e) => {
+                e.stopPropagation();
+                await window.api.deleteBookmark(bm.id);
+                state.bookmarks = state.bookmarks.filter(b => b.id !== bm.id);
+                showBookmarkDropdown();
+                updateBookmarkButton();
+            });
+            list.appendChild(item);
+        }
+    }
+
+    const btn = document.getElementById('btn-bookmark-list');
+    const rect = btn.getBoundingClientRect();
+    dropdown.style.display = 'block';
+    dropdown.style.left = Math.min(rect.left, window.innerWidth - 240) + 'px';
+    dropdown.style.top = (rect.bottom + 4) + 'px';
+}
+
+function hideBookmarkDropdown() {
+    document.getElementById('bookmark-dropdown').style.display = 'none';
+}
 
 async function handleContextAction(action) {
     hideContextMenu();
@@ -1112,6 +1220,14 @@ async function handleContextAction(action) {
     switch (action) {
         case 'open': openPdfTab(contextBookId); break;
         case 'rename': openRenameModal(contextBookId); break;
+        case 'status-unread':
+        case 'status-reading':
+        case 'status-completed': {
+            const newStatus = action.replace('status-', '');
+            await window.api.updateBook(contextBookId, { status: newStatus });
+            await loadData(); renderBooks();
+            break;
+        }
         case 'set-cover': {
             const imagePath = await window.api.selectCoverImage();
             if (imagePath) { await window.api.setCustomCover(contextBookId, imagePath); await loadData(); renderBooks(); }
