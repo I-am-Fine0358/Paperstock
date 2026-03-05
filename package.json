@@ -1,6 +1,6 @@
 {
     "name": "paperstock",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "PDF Bookshelf Manager for macOS — manage, organize, and read your PDF collection",
     "main": "main.js",
     "scripts": {
