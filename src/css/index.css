@@ -1351,6 +1351,7 @@ body {
 
 .viewer-pages.spread .spread-pair {
   display: flex;
+  flex-direction: row-reverse;
   gap: 0;
   align-items: flex-start;
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
