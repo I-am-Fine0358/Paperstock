@@ -1449,6 +1449,28 @@ async function handleContextAction(action) {
             if (book) window.api.showInFinder(book.file_path);
             break;
         }
+        case 'notion-open': {
+            const url = await window.api.getNotionPageUrl(contextBookId);
+            if (url) {
+                window.open(url, '_blank');
+            } else {
+                // Sync first, then open
+                try {
+                    await window.api.notionSyncBook(contextBookId);
+                    await loadData();
+                    const newUrl = await window.api.getNotionPageUrl(contextBookId);
+                    if (newUrl) window.open(newUrl, '_blank');
+                } catch (e) { /* settings not configured */ }
+            }
+            break;
+        }
+        case 'notion-sync': {
+            try {
+                await window.api.notionSyncBook(contextBookId);
+                await loadData();
+            } catch (e) { /* settings not configured */ }
+            break;
+        }
         case 'delete': {
             await window.api.removeBook(contextBookId);
             const tab = tabs.find(t => t.bookId === contextBookId);

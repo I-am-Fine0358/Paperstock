@@ -52,6 +52,7 @@ contextBridge.exposeInMainWorld('api', {
     notionTestConnection: () => ipcRenderer.invoke('notion-test-connection'),
     notionSyncAll: () => ipcRenderer.invoke('notion-sync-all'),
     notionSyncBook: (bookId) => ipcRenderer.invoke('notion-sync-book', bookId),
+    getNotionPageUrl: (bookId) => ipcRenderer.invoke('get-notion-page-url', bookId),
 
     // Menu events
     onMenuAddBooks: (callback) => ipcRenderer.on('menu-add-books', callback),

@@ -284,7 +284,18 @@ ipcMain.handle('notion-sync-all', async () => {
 });
 ipcMain.handle('notion-sync-book', async (_, bookId) => {
     const book = db.getBook(bookId);
-    if (book) await notionSync.syncBook(book);
+    if (book) {
+        const comments = db.getCommentsForBook(bookId);
+        await notionSync.syncBook(book, comments);
+    }
+});
+ipcMain.handle('get-notion-page-url', (_, bookId) => {
+    const book = db.getBook(bookId);
+    if (book && book.notion_page_id) {
+        const cleanId = book.notion_page_id.replace(/-/g, '');
+        return `https://www.notion.so/${cleanId}`;
+    }
+    return null;
 });
 
 // ── Migration for existing books ─────────────────────
