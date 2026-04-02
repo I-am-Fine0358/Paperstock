@@ -1082,6 +1082,7 @@ function setupEventListeners() {
     document.getElementById('btn-add-books').addEventListener('click', addBooks);
     window.api.onMenuAddBooks(addBooks);
     window.api.onMenuCloseTab(() => { if (activeTabId !== 'bookshelf') closeTab(activeTabId); });
+    window.api.onMenuOpenSettings(() => openSettingsModal());
 
     let searchTimeout;
     document.getElementById('search-input').addEventListener('input', () => {
@@ -1161,6 +1162,13 @@ function setupEventListeners() {
     document.getElementById('group-modal-cancel').addEventListener('click', closeAllModals);
     document.getElementById('group-modal-save').addEventListener('click', saveGroup);
     document.getElementById('move-group-close').addEventListener('click', closeAllModals);
+
+    // Settings modal
+    document.getElementById('settings-modal-close').addEventListener('click', closeAllModals);
+    document.getElementById('settings-modal-cancel').addEventListener('click', closeAllModals);
+    document.getElementById('settings-modal-save').addEventListener('click', saveSettings);
+    document.getElementById('btn-notion-test').addEventListener('click', testNotionConnection);
+    document.getElementById('btn-notion-sync-all').addEventListener('click', syncAllToNotion);
 
     document.querySelectorAll('#tab-context-menu button').forEach(btn => {
         btn.addEventListener('click', () => handleTabContextAction(btn.dataset.action));
@@ -1604,6 +1612,71 @@ function renderColorPalette(elementId, selectedColor, onSelect) {
             onSelect(swatch.dataset.color);
         });
     });
+}
+
+// ── Settings ────────────────────────────────────────
+
+async function openSettingsModal() {
+    const s = await window.api.getSettings();
+    document.getElementById('setting-notion-sync').checked = s.notionSyncEnabled;
+    document.getElementById('setting-notion-token').value = s.notionToken || '';
+    document.getElementById('setting-notion-page-id').value = s.notionPageId || '';
+    document.getElementById('notion-status').textContent = '';
+    document.getElementById('settings-modal').style.display = 'flex';
+}
+
+async function saveSettings() {
+    const updates = {
+        notionSyncEnabled: document.getElementById('setting-notion-sync').checked,
+        notionToken: document.getElementById('setting-notion-token').value.trim(),
+        notionPageId: document.getElementById('setting-notion-page-id').value.trim(),
+    };
+    await window.api.updateSettings(updates);
+    closeAllModals();
+}
+
+async function testNotionConnection() {
+    const statusEl = document.getElementById('notion-status');
+    statusEl.textContent = '接続中…';
+    statusEl.className = 'setting-status';
+
+    // Save current values first
+    await saveSettingsQuiet();
+
+    try {
+        const result = await window.api.notionTestConnection();
+        statusEl.textContent = '接続成功';
+        statusEl.className = 'setting-status success';
+    } catch (e) {
+        statusEl.textContent = `エラー: ${e.message || '接続失敗'}`;
+        statusEl.className = 'setting-status error';
+    }
+}
+
+async function syncAllToNotion() {
+    const statusEl = document.getElementById('notion-status');
+    statusEl.textContent = '同期中…';
+    statusEl.className = 'setting-status';
+
+    await saveSettingsQuiet();
+
+    try {
+        const result = await window.api.notionSyncAll();
+        statusEl.textContent = `${result.synced}冊同期完了${result.errors ? ` (${result.errors}件エラー)` : ''}`;
+        statusEl.className = result.errors ? 'setting-status error' : 'setting-status success';
+    } catch (e) {
+        statusEl.textContent = `エラー: ${e.message || '同期失敗'}`;
+        statusEl.className = 'setting-status error';
+    }
+}
+
+async function saveSettingsQuiet() {
+    const updates = {
+        notionSyncEnabled: document.getElementById('setting-notion-sync').checked,
+        notionToken: document.getElementById('setting-notion-token').value.trim(),
+        notionPageId: document.getElementById('setting-notion-page-id').value.trim(),
+    };
+    await window.api.updateSettings(updates);
 }
 
 function closeAllModals() { document.querySelectorAll('.modal-overlay').forEach(m => m.style.display = 'none'); }

@@ -3,14 +3,19 @@ const path = require('path');
 const fs = require('fs');
 const BookDatabase = require('./lib/database');
 const { extractCover, getPdfPageCount } = require('./lib/pdf-utils');
+const Settings = require('./lib/settings');
+const NotionSync = require('./lib/notion-sync');
 
 // ── Paths ────────────────────────────────────────────
 const userDataPath = app.getPath('userData');
 const dbPath = path.join(userDataPath, 'paperstock.db');
 const coversDir = path.join(userDataPath, 'covers');
 const pdfsDir = path.join(userDataPath, 'pdfs');
+const settingsPath = path.join(userDataPath, 'settings.json');
 
 let db;
+let settings;
+let notionSync;
 let mainWindow;
 
 // ── Window ───────────────────────────────────────────
@@ -40,6 +45,12 @@ function buildMenu() {
             label: app.name,
             submenu: [
                 { role: 'about' },
+                { type: 'separator' },
+                {
+                    label: '設定…',
+                    accelerator: 'CmdOrCtrl+,',
+                    click: () => mainWindow?.webContents.send('menu-open-settings'),
+                },
                 { type: 'separator' },
                 { role: 'hide' },
                 { role: 'hideOthers' },
@@ -122,7 +133,14 @@ ipcMain.handle('remove-book', (_, id) => {
     }
     db.removeBook(id);
 });
-ipcMain.handle('update-book', (_, id, updates) => db.updateBook(id, updates));
+ipcMain.handle('update-book', async (_, id, updates) => {
+    const book = db.updateBook(id, updates);
+    // Auto-sync to Notion on status/favorite change
+    if (notionSync && (updates.status !== undefined || updates.favorite !== undefined || updates.lastOpenedAt !== undefined)) {
+        notionSync.syncBook(book).catch(() => {});
+    }
+    return book;
+});
 
 // Tags
 ipcMain.handle('get-tags', () => db.getAllTags());
@@ -249,7 +267,26 @@ ipcMain.handle('get-bookmarks', (_, bookId) => db.getBookmarks(bookId));
 ipcMain.handle('update-bookmark', (_, id, data) => db.updateBookmark(id, data));
 ipcMain.handle('delete-bookmark', (_, id) => db.deleteBookmark(id));
 
-// ── App Lifecycle ────────────────────────────────────
+// Settings
+ipcMain.handle('get-settings', () => settings.getAll());
+ipcMain.handle('update-settings', (_, updates) => {
+    settings.update(updates);
+    notionSync.resetClient(); // reset in case token changed
+    return settings.getAll();
+});
+
+// Notion sync
+ipcMain.handle('notion-test-connection', async () => {
+    return await notionSync.testConnection();
+});
+ipcMain.handle('notion-sync-all', async () => {
+    return await notionSync.syncAllBooks();
+});
+ipcMain.handle('notion-sync-book', async (_, bookId) => {
+    const book = db.getBook(bookId);
+    if (book) await notionSync.syncBook(book);
+});
+
 // ── Migration for existing books ─────────────────────
 async function migrateExistingBooks() {
     const books = db.getAllBooks();
@@ -281,6 +318,8 @@ async function migrateExistingBooks() {
 // ── App Lifecycle ────────────────────────────────────
 app.whenReady().then(() => {
     db = new BookDatabase(dbPath);
+    settings = new Settings(settingsPath);
+    notionSync = new NotionSync(settings, db);
     if (!fs.existsSync(pdfsDir)) fs.mkdirSync(pdfsDir, { recursive: true });
     buildMenu();
     createMainWindow();
