@@ -41,6 +41,7 @@ contextBridge.exposeInMainWorld('api', {
     // Bookmarks
     addBookmark: (data) => ipcRenderer.invoke('add-bookmark', data),
     getBookmarks: (bookId) => ipcRenderer.invoke('get-bookmarks', bookId),
+    updateBookmark: (id, data) => ipcRenderer.invoke('update-bookmark', id, data),
     deleteBookmark: (id) => ipcRenderer.invoke('delete-bookmark', id),
 
     // Menu events

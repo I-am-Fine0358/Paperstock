@@ -1,8 +1,8 @@
-version: 1.0.0
+version: 1.0.1
 files:
-  - url: Paperstock-1.0.0-arm64.dmg
-    sha512: RVDsrq92qrmQ6CnXy6P8dPUw5fOzdL7xDqVloPSxkWjxjxZ01xdwwZEGOTxblNyItzKuEG9JxT3Kq8IjJSgn6Q==
-    size: 133385248
-path: Paperstock-1.0.0-arm64.dmg
-sha512: RVDsrq92qrmQ6CnXy6P8dPUw5fOzdL7xDqVloPSxkWjxjxZ01xdwwZEGOTxblNyItzKuEG9JxT3Kq8IjJSgn6Q==
-releaseDate: '2026-03-03T18:23:01.516Z'
+  - url: Paperstock-1.0.1-arm64.dmg
+    sha512: +YlSUKlPzK56CKLgst5/L5yKqqeNlPOzMq3VT7m5hliwvUdMkIbM4608wHdGkARtcIZRLcf46cTGJB7fhkUC2g==
+    size: 133408485
+path: Paperstock-1.0.1-arm64.dmg
+sha512: +YlSUKlPzK56CKLgst5/L5yKqqeNlPOzMq3VT7m5hliwvUdMkIbM4608wHdGkARtcIZRLcf46cTGJB7fhkUC2g==
+releaseDate: '2026-03-06T05:25:03.516Z'

@@ -211,6 +211,7 @@ ipcMain.handle('delete-comment', (_, id) => db.deleteComment(id));
 // Bookmarks
 ipcMain.handle('add-bookmark', (_, data) => db.addBookmark(data));
 ipcMain.handle('get-bookmarks', (_, bookId) => db.getBookmarks(bookId));
+ipcMain.handle('update-bookmark', (_, id, data) => db.updateBookmark(id, data));
 ipcMain.handle('delete-bookmark', (_, id) => db.deleteBookmark(id));
 
 // ── App Lifecycle ────────────────────────────────────

@@ -309,11 +309,19 @@ async function loadPdfForTab(tabId, book) {
     }
 }
 
-async function renderPdfPages(tabId) {
+async function renderPdfPages(tabId, preserveScroll = false) {
     const state = pdfStates[tabId];
     if (!state || !state.pdfDoc || tabId !== activeTabId) return;
 
     const pagesContainer = document.getElementById('viewer-pages');
+    const viewerContainer = document.getElementById('viewer-container');
+
+    // Save current scroll ratio if we want to preserve it
+    let scrollRatioX = 0, scrollRatioY = 0;
+    if (preserveScroll && pagesContainer.scrollWidth > 0 && pagesContainer.scrollHeight > 0) {
+        scrollRatioX = viewerContainer.scrollLeft / pagesContainer.scrollWidth;
+        scrollRatioY = viewerContainer.scrollTop / pagesContainer.scrollHeight;
+    }
 
     hideCommentPopup();
 
@@ -350,8 +358,15 @@ async function renderPdfPages(tabId) {
     document.getElementById('btn-prev').disabled = state.currentPage <= 1;
     document.getElementById('btn-next').disabled = state.currentPage >= state.totalPages;
 
-    document.getElementById('viewer-container').scrollTop = 0;
-    document.getElementById('viewer-container').scrollLeft = 0;
+    if (preserveScroll && pagesContainer.scrollWidth > 0 && pagesContainer.scrollHeight > 0) {
+        // Restore scroll position based on ratio
+        viewerContainer.scrollLeft = scrollRatioX * pagesContainer.scrollWidth;
+        viewerContainer.scrollTop = scrollRatioY * pagesContainer.scrollHeight;
+    } else {
+        viewerContainer.scrollTop = 0;
+        viewerContainer.scrollLeft = 0;
+    }
+
     updateThumbnailHighlight(tabId);
     updateBookmarkButton();
 }
@@ -519,7 +534,7 @@ function viewerNav(delta) {
     } else {
         state.currentPage = Math.max(1, Math.min(state.currentPage + delta, state.totalPages));
     }
-    renderPdfPages(activeTabId);
+    renderPdfPages(activeTabId, true);
 }
 
 function viewerSetZoom(newScale) {
@@ -1147,7 +1162,7 @@ async function toggleBookmark() {
         await window.api.deleteBookmark(existing.id);
         state.bookmarks = state.bookmarks.filter(b => b.id !== existing.id);
     } else {
-        const bm = await window.api.addBookmark({ bookId: state.bookId, pageNum: state.currentPage, label: '' });
+        const bm = await window.api.addBookmark({ bookId: state.bookId, pageNum: state.currentPage, label: '栞' });
         state.bookmarks.push(bm);
     }
     updateBookmarkButton();
@@ -1181,17 +1196,23 @@ function showBookmarkDropdown() {
         for (const bm of state.bookmarks) {
             const item = document.createElement('div');
             item.className = 'bookmark-item';
+
+            // Render basic UI
             item.innerHTML = `
                 <span class="bookmark-page">P.${bm.page_num}</span>
-                <span class="bookmark-label">${bm.label || '\u6816'}</span>
-                <button class="bookmark-delete" title="\u524a\u9664">\u00d7</button>
+                <span class="bookmark-label">${escapeHtml(bm.label || '栞')}</span>
+                <button class="bookmark-delete" title="削除">×</button>
             `;
+
+            // Navigation
             item.addEventListener('click', (e) => {
-                if (e.target.closest('.bookmark-delete')) return;
+                if (e.target.closest('.bookmark-delete') || e.target.tagName === 'INPUT') return;
                 state.currentPage = bm.page_num;
                 renderPdfPages(activeTabId);
                 hideBookmarkDropdown();
             });
+
+            // Delete
             item.querySelector('.bookmark-delete').addEventListener('click', async (e) => {
                 e.stopPropagation();
                 await window.api.deleteBookmark(bm.id);
@@ -1199,6 +1220,36 @@ function showBookmarkDropdown() {
                 showBookmarkDropdown();
                 updateBookmarkButton();
             });
+
+            // Inline Edit
+            const labelEl = item.querySelector('.bookmark-label');
+            labelEl.addEventListener('dblclick', (e) => {
+                e.stopPropagation();
+                const currentLabel = bm.label || '栞';
+                labelEl.innerHTML = `<input type="text" class="bookmark-inline-input" value="${escapeHtml(currentLabel)}" />`;
+                const input = labelEl.querySelector('input');
+
+                const saveLabel = async () => {
+                    const newLabel = input.value.trim() || '栞';
+                    const updated = await window.api.updateBookmark(bm.id, { label: newLabel });
+                    bm.label = updated.label;
+                    showBookmarkDropdown();
+                };
+
+                input.addEventListener('blur', saveLabel);
+                input.addEventListener('keydown', (ke) => {
+                    if (ke.key === 'Enter') {
+                        input.blur();
+                    } else if (ke.key === 'Escape') {
+                        // Cancel
+                        showBookmarkDropdown();
+                    }
+                });
+
+                input.focus();
+                input.select();
+            });
+
             list.appendChild(item);
         }
     }

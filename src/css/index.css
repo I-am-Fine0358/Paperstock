@@ -1770,6 +1770,21 @@ body {
   white-space: nowrap;
 }
 
+.bookmark-inline-input {
+  width: 100%;
+  border: 1px solid var(--border);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  border-radius: 4px;
+  padding: 2px 4px;
+  font-size: 13px;
+  outline: none;
+}
+
+.bookmark-inline-input:focus {
+  border-color: var(--accent);
+}
+
 .bookmark-item .bookmark-delete {
   border: none;
   background: none;
