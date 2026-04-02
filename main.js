@@ -8,6 +8,7 @@ const { extractCover, getPdfPageCount } = require('./lib/pdf-utils');
 const userDataPath = app.getPath('userData');
 const dbPath = path.join(userDataPath, 'paperstock.db');
 const coversDir = path.join(userDataPath, 'covers');
+const pdfsDir = path.join(userDataPath, 'pdfs');
 
 let db;
 let mainWindow;
@@ -115,6 +116,10 @@ ipcMain.handle('remove-book', (_, id) => {
     if (book && book.cover_path && fs.existsSync(book.cover_path)) {
         fs.unlinkSync(book.cover_path);
     }
+    // Delete copied PDF if it's inside our managed pdfs directory
+    if (book && book.file_path && book.file_path.startsWith(pdfsDir) && fs.existsSync(book.file_path)) {
+        fs.unlinkSync(book.file_path);
+    }
     db.removeBook(id);
 });
 ipcMain.handle('update-book', (_, id, updates) => db.updateBook(id, updates));
@@ -144,18 +149,48 @@ ipcMain.handle('select-cover-image', async () => {
     return result.filePaths[0] || null;
 });
 
-// Import a PDF
+// Import a PDF — copy to app data directory
 ipcMain.handle('import-pdf', async (_, filePath) => {
+    const basename = path.basename(filePath);
+    let destPath = path.join(pdfsDir, basename);
+
+    // Check if the same destination path already exists in DB
     try {
-        const existing = db.getAllBooks().find(b => b.file_path === filePath);
+        const existing = db.getAllBooks().find(b => b.file_path === destPath);
         if (existing) return existing;
     } catch (e) { /* continue */ }
 
-    const title = path.basename(filePath, '.pdf');
-    const pageCount = await getPdfPageCount(filePath);
-    const book = db.addBook({ title, filePath, coverPath: null, pageCount });
+    // Check if file with same name already exists on disk
+    if (fs.existsSync(destPath)) {
+        const { response } = await dialog.showMessageBox(mainWindow, {
+            type: 'warning',
+            buttons: ['別名で保存', 'スキップ'],
+            defaultId: 0,
+            cancelId: 1,
+            title: 'ファイル名の重複',
+            message: `「${basename}」は既に存在します`,
+            detail: '別名で保存しますか？',
+        });
+        if (response === 1) return null; // skip
 
-    const coverPath = await extractCover(filePath, coversDir, book.id);
+        // Generate unique filename with suffix
+        const ext = path.extname(basename);
+        const name = path.basename(basename, ext);
+        let suffix = 1;
+        while (fs.existsSync(destPath)) {
+            destPath = path.join(pdfsDir, `${name}_${suffix}${ext}`);
+            suffix++;
+        }
+    }
+
+    // Copy PDF to app data directory
+    fs.copyFileSync(filePath, destPath);
+
+    const title = path.basename(destPath, '.pdf');
+    const pageCount = await getPdfPageCount(destPath);
+    const book = db.addBook({ title, filePath: destPath, coverPath: null, pageCount });
+
+    const coverPath = await extractCover(destPath, coversDir, book.id);
     if (coverPath) {
         db.updateBook(book.id, { coverPath });
         book.cover_path = coverPath;
@@ -215,10 +250,41 @@ ipcMain.handle('update-bookmark', (_, id, data) => db.updateBookmark(id, data));
 ipcMain.handle('delete-bookmark', (_, id) => db.deleteBookmark(id));
 
 // ── App Lifecycle ────────────────────────────────────
+// ── Migration for existing books ─────────────────────
+async function migrateExistingBooks() {
+    const books = db.getAllBooks();
+    for (const book of books) {
+        if (book.file_path && !book.file_path.startsWith(pdfsDir)) {
+            if (fs.existsSync(book.file_path)) {
+                const basename = path.basename(book.file_path);
+                let destPath = path.join(pdfsDir, basename);
+                if (fs.existsSync(destPath)) {
+                    const ext = path.extname(basename);
+                    const name = path.basename(basename, ext);
+                    let suffix = 1;
+                    while (fs.existsSync(destPath)) {
+                        destPath = path.join(pdfsDir, `${name}_${suffix}${ext}`);
+                        suffix++;
+                    }
+                }
+                try {
+                    fs.copyFileSync(book.file_path, destPath);
+                    db.updateBook(book.id, { filePath: destPath });
+                } catch (e) {
+                    console.warn(`Failed to migrate PDF for book ${book.id}:`, e.message);
+                }
+            }
+        }
+    }
+}
+
+// ── App Lifecycle ────────────────────────────────────
 app.whenReady().then(() => {
     db = new BookDatabase(dbPath);
+    if (!fs.existsSync(pdfsDir)) fs.mkdirSync(pdfsDir, { recursive: true });
     buildMenu();
     createMainWindow();
+    migrateExistingBooks();
 
     app.on('activate', () => {
         if (BrowserWindow.getAllWindows().length === 0) createMainWindow();
