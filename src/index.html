@@ -63,7 +63,39 @@
             </svg>
             <span>最近追加</span>
           </button>
+          <button class="nav-item" data-filter="recent-opened" id="nav-recent-opened">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/>
+              <path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/>
+            </svg>
+            <span>最近読んだ本</span>
+          </button>
+          <button class="nav-item" data-filter="favorites" id="nav-favorites">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
+            </svg>
+            <span>お気に入り</span>
+          </button>
         </nav>
+        <div class="sidebar-section">
+          <div class="section-header">
+            <h2>ステータス</h2>
+          </div>
+          <nav class="sidebar-nav status-nav">
+            <button class="nav-item" data-filter="status-unread" id="nav-status-unread">
+              <span class="status-dot unread"></span>
+              <span>未読</span>
+            </button>
+            <button class="nav-item" data-filter="status-reading" id="nav-status-reading">
+              <span class="status-dot reading"></span>
+              <span>読書中</span>
+            </button>
+            <button class="nav-item" data-filter="status-completed" id="nav-status-completed">
+              <span class="status-dot completed"></span>
+              <span>読了</span>
+            </button>
+          </nav>
+        </div>
         <div class="sidebar-section">
           <div class="section-header">
             <h2>タグ</h2>
@@ -85,7 +117,17 @@
             <span id="book-count" class="book-count"></span>
             <div class="view-mode-btns">
               <button class="view-mode-btn active" id="btn-view-grid" title="グリッド表示">グリッド</button>
+              <button class="view-mode-btn" id="btn-view-list" title="リスト表示">リスト</button>
               <button class="view-mode-btn" id="btn-view-stacks" title="スタック表示">スタック</button>
+            </div>
+            <div class="sort-dropdown-wrap">
+              <select id="sort-select" class="sort-select">
+                <option value="updated_at">更新日</option>
+                <option value="title">タイトル</option>
+                <option value="created_at">追加日</option>
+                <option value="page_count">ページ数</option>
+                <option value="status">ステータス</option>
+              </select>
             </div>
           </div>
           <div class="toolbar-right">

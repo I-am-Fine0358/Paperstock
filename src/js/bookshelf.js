@@ -15,7 +15,8 @@ let allTags = [];
 let currentFilter = 'all';
 let currentTagId = null;
 let contextBookId = null;
-let viewMode = 'grid'; // 'grid' | 'stacks'
+let viewMode = 'grid'; // 'grid' | 'list' | 'stacks'
+let currentSort = localStorage.getItem('ps-sort') || 'updated_at';
 let stacksExpanded = {}; // tagId -> boolean
 let bookshelfCardSize = parseInt(localStorage.getItem('ps-card-size')) || 150;
 
@@ -78,12 +79,13 @@ function openPdfTab(bookId) {
     const book = allBooks.find(b => b.id === bookId);
     if (!book) return;
 
-    // Auto-set status to reading
-    if (book.status === 'unread') {
-        window.api.updateBook(bookId, { status: 'reading' });
-        book.status = 'reading';
-        renderBooks();
-    }
+    // Auto-set status to reading + track last opened
+    const updates = { lastOpenedAt: new Date().toISOString() };
+    if (book.status === 'unread') updates.status = 'reading';
+    window.api.updateBook(bookId, updates);
+    book.last_opened_at = updates.lastOpenedAt;
+    if (updates.status) book.status = updates.status;
+    renderBooks();
 
     const tabId = 'pdf-' + nextTabId++;
     tabs.push({ id: tabId, type: 'pdf', bookId, title: book.title, groupId: null });
@@ -690,12 +692,32 @@ async function renderBooks() {
     const emptyState = document.getElementById('empty-state');
     const countEl = document.getElementById('book-count');
 
-    let books = allBooks;
+    let books = [...allBooks];
+
+    // Filter
     if (currentFilter === 'tag' && currentTagId) {
         books = books.filter(b => b.tags.some(t => t.id === currentTagId));
+    } else if (currentFilter === 'favorites') {
+        books = books.filter(b => b.favorite);
+    } else if (currentFilter === 'recent-opened') {
+        books = books.filter(b => b.last_opened_at);
+        books.sort((a, b) => (b.last_opened_at || '').localeCompare(a.last_opened_at || ''));
+    } else if (currentFilter === 'status-unread') {
+        books = books.filter(b => b.status === 'unread');
+    } else if (currentFilter === 'status-reading') {
+        books = books.filter(b => b.status === 'reading');
+    } else if (currentFilter === 'status-completed') {
+        books = books.filter(b => b.status === 'completed');
     }
+
+    // Search
     const query = document.getElementById('search-input').value.trim().toLowerCase();
     if (query) books = books.filter(b => b.title.toLowerCase().includes(query));
+
+    // Sort (skip for recent-opened which has its own sort)
+    if (currentFilter !== 'recent-opened') {
+        books = sortBooks(books, currentSort);
+    }
 
     countEl.textContent = books.length > 0 ? `${books.length}冊` : '';
 
@@ -705,14 +727,38 @@ async function renderBooks() {
         return;
     }
 
-    grid.style.display = 'grid';
     emptyState.style.display = 'none';
 
     if (viewMode === 'stacks' && allTags.length > 0) {
+        grid.style.display = 'grid';
         await renderStacksView(grid, books);
+    } else if (viewMode === 'list') {
+        grid.style.display = 'block';
+        await renderListView(grid, books);
     } else {
+        grid.style.display = 'grid';
         await renderGridView(grid, books);
     }
+}
+
+function sortBooks(books, sortBy) {
+    return books.sort((a, b) => {
+        switch (sortBy) {
+            case 'title':
+                return a.title.localeCompare(b.title, 'ja');
+            case 'created_at':
+                return (b.created_at || '').localeCompare(a.created_at || '');
+            case 'page_count':
+                return (b.page_count || 0) - (a.page_count || 0);
+            case 'status': {
+                const order = { reading: 0, unread: 1, completed: 2 };
+                return (order[a.status] ?? 1) - (order[b.status] ?? 1);
+            }
+            case 'updated_at':
+            default:
+                return (b.updated_at || '').localeCompare(a.updated_at || '');
+        }
+    });
 }
 
 async function renderGridView(grid, books) {
@@ -829,6 +875,75 @@ async function renderStacksView(grid, books) {
     }
 }
 
+async function renderListView(grid, books) {
+    grid.innerHTML = '';
+    const table = document.createElement('div');
+    table.className = 'book-list';
+
+    // Header
+    const header = document.createElement('div');
+    header.className = 'book-list-header';
+    header.innerHTML = `
+        <span class="list-col-fav"></span>
+        <span class="list-col-title">タイトル</span>
+        <span class="list-col-status">ステータス</span>
+        <span class="list-col-pages">ページ</span>
+        <span class="list-col-date">追加日</span>
+    `;
+    table.appendChild(header);
+
+    for (const book of books) {
+        const row = document.createElement('div');
+        row.className = 'book-list-row';
+        row.dataset.id = book.id;
+
+        const statusLabel = book.status === 'reading' ? '読書中' : book.status === 'completed' ? '読了' : '未読';
+        const statusClass = book.status || 'unread';
+        const dateStr = book.created_at ? new Date(book.created_at).toLocaleDateString('ja-JP') : '';
+        const favClass = book.favorite ? 'fav-active' : '';
+
+        row.innerHTML = `
+            <span class="list-col-fav">
+                <button class="fav-btn ${favClass}" data-id="${book.id}" title="お気に入り">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="${book.favorite ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2">
+                        <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
+                    </svg>
+                </button>
+            </span>
+            <span class="list-col-title">${escapeHtml(book.title)}</span>
+            <span class="list-col-status"><span class="status-pill ${statusClass}">${statusLabel}</span></span>
+            <span class="list-col-pages">${book.page_count || '-'}</span>
+            <span class="list-col-date">${dateStr}</span>
+        `;
+
+        row.addEventListener('click', (e) => {
+            if (e.target.closest('.fav-btn')) return;
+            openPdfTab(book.id);
+        });
+        row.addEventListener('contextmenu', (e) => {
+            e.preventDefault(); showContextMenu(e.clientX, e.clientY, book.id);
+        });
+
+        const favBtn = row.querySelector('.fav-btn');
+        favBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            toggleFavorite(book.id);
+        });
+
+        table.appendChild(row);
+    }
+    grid.appendChild(table);
+}
+
+async function toggleFavorite(bookId) {
+    const book = allBooks.find(b => b.id === bookId);
+    if (!book) return;
+    const newVal = book.favorite ? 0 : 1;
+    await window.api.updateBook(bookId, { favorite: newVal });
+    book.favorite = newVal;
+    renderBooks();
+}
+
 async function createBookCard(book) {
     const card = document.createElement('div');
     card.className = 'book-card';
@@ -852,15 +967,28 @@ async function createBookCard(book) {
     if (book.status === 'reading') statusHtml = '<div class="status-badge reading">読書中</div>';
     else if (book.status === 'completed') statusHtml = '<div class="status-badge completed">読了</div>';
 
+    const favHtml = `<button class="fav-btn-card ${book.favorite ? 'fav-active' : ''}" data-id="${book.id}" title="お気に入り">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="${book.favorite ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2">
+            <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
+        </svg>
+    </button>`;
+
     card.innerHTML = `
-    <div class="book-cover-wrapper">${coverHtml}${statusHtml}</div>
+    <div class="book-cover-wrapper">${coverHtml}${statusHtml}${favHtml}</div>
     <div class="book-info">
       <div class="book-title">${escapeHtml(book.title)}</div>
       ${tagsHtml ? `<div class="book-tags">${tagsHtml}</div>` : ''}
     </div>
   `;
 
-    card.addEventListener('click', () => openPdfTab(book.id));
+    card.querySelector('.fav-btn-card').addEventListener('click', (e) => {
+        e.stopPropagation();
+        toggleFavorite(book.id);
+    });
+    card.addEventListener('click', (e) => {
+        if (e.target.closest('.fav-btn-card')) return;
+        openPdfTab(book.id);
+    });
     card.addEventListener('contextmenu', (e) => {
         e.preventDefault(); showContextMenu(e.clientX, e.clientY, book.id);
     });
@@ -922,9 +1050,20 @@ function setFilter(type, tagId = null, tagName = '') {
     document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
     document.querySelectorAll('.tag-item').forEach(n => n.classList.remove('active'));
     const titleEl = document.getElementById('view-title');
-    if (type === 'all') { document.getElementById('nav-all').classList.add('active'); titleEl.textContent = 'すべての本'; }
-    else if (type === 'recent') { document.getElementById('nav-recent').classList.add('active'); titleEl.textContent = '最近追加'; }
-    else if (type === 'tag') {
+    const filterTitles = {
+        'all': 'すべての本',
+        'recent': '最近追加',
+        'recent-opened': '最近読んだ本',
+        'favorites': 'お気に入り',
+        'status-unread': '未読',
+        'status-reading': '読書中',
+        'status-completed': '読了',
+    };
+    if (filterTitles[type]) {
+        const navEl = document.getElementById(`nav-${type}`);
+        if (navEl) navEl.classList.add('active');
+        titleEl.textContent = filterTitles[type];
+    } else if (type === 'tag') {
         titleEl.textContent = tagName;
         document.querySelectorAll('.tag-item').forEach(btn => {
             const dot = btn.querySelector('.tag-dot');
@@ -951,21 +1090,33 @@ function setupEventListeners() {
 
     document.getElementById('nav-all').addEventListener('click', () => setFilter('all'));
     document.getElementById('nav-recent').addEventListener('click', () => setFilter('recent'));
+    document.getElementById('nav-recent-opened').addEventListener('click', () => setFilter('recent-opened'));
+    document.getElementById('nav-favorites').addEventListener('click', () => setFilter('favorites'));
+    document.getElementById('nav-status-unread').addEventListener('click', () => setFilter('status-unread'));
+    document.getElementById('nav-status-reading').addEventListener('click', () => setFilter('status-reading'));
+    document.getElementById('nav-status-completed').addEventListener('click', () => setFilter('status-completed'));
     document.getElementById('btn-add-tag').addEventListener('click', () => openTagModal());
 
+    // Sort
+    const sortSelect = document.getElementById('sort-select');
+    sortSelect.value = currentSort;
+    sortSelect.addEventListener('change', () => {
+        currentSort = sortSelect.value;
+        localStorage.setItem('ps-sort', currentSort);
+        renderBooks();
+    });
+
     // View mode toggle
-    document.getElementById('btn-view-grid').addEventListener('click', () => {
-        viewMode = 'grid';
-        document.getElementById('btn-view-grid').classList.add('active');
-        document.getElementById('btn-view-stacks').classList.remove('active');
+    const viewBtns = ['btn-view-grid', 'btn-view-list', 'btn-view-stacks'];
+    function setViewMode(mode) {
+        viewMode = mode;
+        viewBtns.forEach(id => document.getElementById(id).classList.remove('active'));
+        document.getElementById(`btn-view-${mode}`).classList.add('active');
         renderBooks();
-    });
-    document.getElementById('btn-view-stacks').addEventListener('click', () => {
-        viewMode = 'stacks';
-        document.getElementById('btn-view-stacks').classList.add('active');
-        document.getElementById('btn-view-grid').classList.remove('active');
-        renderBooks();
-    });
+    }
+    document.getElementById('btn-view-grid').addEventListener('click', () => setViewMode('grid'));
+    document.getElementById('btn-view-list').addEventListener('click', () => setViewMode('list'));
+    document.getElementById('btn-view-stacks').addEventListener('click', () => setViewMode('stacks'));
 
     // Drag and drop
     const main = document.getElementById('main-content');

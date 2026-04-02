@@ -1806,3 +1806,141 @@ body {
   font-size: 12px;
   color: var(--text-tertiary);
 }
+
+/* ═══ Sort Dropdown ═══ */
+
+.sort-dropdown-wrap {
+  position: relative;
+}
+
+.sort-select {
+  appearance: none;
+  -webkit-appearance: none;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 24px 4px 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  outline: none;
+  background-image: url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L5 5L9 1' stroke='%238e8e93' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 6px center;
+}
+
+.sort-select:hover {
+  border-color: var(--accent);
+}
+
+/* ═══ Status Nav in Sidebar ═══ */
+
+.status-nav {
+  padding-top: 0;
+}
+
+.status-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+.status-dot.unread { background: var(--text-tertiary); }
+.status-dot.reading { background: var(--accent); }
+.status-dot.completed { background: #34c759; }
+
+/* ═══ Favorite Button (Grid Card) ═══ */
+
+.fav-btn-card {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  background: rgba(0,0,0,0.4);
+  border: none;
+  border-radius: 50%;
+  width: 26px;
+  height: 26px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  color: white;
+  opacity: 0;
+  transition: opacity var(--transition);
+  z-index: 2;
+}
+
+.book-card:hover .fav-btn-card,
+.fav-btn-card.fav-active {
+  opacity: 1;
+}
+
+.fav-btn-card.fav-active {
+  color: #ffcc00;
+  background: rgba(0,0,0,0.5);
+}
+
+/* ═══ List View ═══ */
+
+.book-list {
+  width: 100%;
+}
+
+.book-list-header {
+  display: flex;
+  align-items: center;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.book-list-row {
+  display: flex;
+  align-items: center;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--bg-tertiary);
+  cursor: pointer;
+  transition: background var(--transition);
+  font-size: 13px;
+}
+
+.book-list-row:hover {
+  background: var(--bg-secondary);
+}
+
+.list-col-fav { width: 32px; flex-shrink: 0; }
+.list-col-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.list-col-status { width: 80px; flex-shrink: 0; text-align: center; }
+.list-col-pages { width: 60px; flex-shrink: 0; text-align: right; color: var(--text-tertiary); font-size: 12px; }
+.list-col-date { width: 90px; flex-shrink: 0; text-align: right; color: var(--text-tertiary); font-size: 12px; }
+
+.fav-btn {
+  background: none;
+  border: none;
+  cursor: pointer;
+  color: var(--text-tertiary);
+  padding: 2px;
+  display: flex;
+  align-items: center;
+}
+
+.fav-btn.fav-active {
+  color: #ffcc00;
+}
+
+.status-pill {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 10px;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.status-pill.unread { background: var(--bg-tertiary); color: var(--text-secondary); }
+.status-pill.reading { background: rgba(0,122,255,0.12); color: var(--accent); }
+.status-pill.completed { background: rgba(52,199,89,0.12); color: #34c759; }
