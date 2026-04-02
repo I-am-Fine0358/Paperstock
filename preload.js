@@ -44,18 +44,7 @@ contextBridge.exposeInMainWorld('api', {
     updateBookmark: (id, data) => ipcRenderer.invoke('update-bookmark', id, data),
     deleteBookmark: (id) => ipcRenderer.invoke('delete-bookmark', id),
 
-    // Settings
-    getSettings: () => ipcRenderer.invoke('get-settings'),
-    updateSettings: (updates) => ipcRenderer.invoke('update-settings', updates),
-
-    // Notion
-    notionTestConnection: () => ipcRenderer.invoke('notion-test-connection'),
-    notionSyncAll: () => ipcRenderer.invoke('notion-sync-all'),
-    notionSyncBook: (bookId) => ipcRenderer.invoke('notion-sync-book', bookId),
-    getNotionPageUrl: (bookId) => ipcRenderer.invoke('get-notion-page-url', bookId),
-
     // Menu events
     onMenuAddBooks: (callback) => ipcRenderer.on('menu-add-books', callback),
     onMenuCloseTab: (callback) => ipcRenderer.on('menu-close-tab', callback),
-    onMenuOpenSettings: (callback) => ipcRenderer.on('menu-open-settings', callback),
 });

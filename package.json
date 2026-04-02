@@ -60,7 +60,6 @@
     "author": "",
     "license": "MIT",
     "dependencies": {
-        "@notionhq/client": "^5.16.0",
         "better-sqlite3": "^12.6.2",
         "pdfjs-dist": "^5.5.207"
     },
