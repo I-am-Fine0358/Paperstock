@@ -3,7 +3,7 @@
    Tab-based bookshelf + enhanced PDF viewer
    ══════════════════════════════════════════════════════ */
 
-const { invoke } = window.__TAURI__.core;
+const { invoke, convertFileSrc } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const { getCurrentWebviewWindow } = window.__TAURI__.webviewWindow;
 
@@ -284,9 +284,8 @@ async function loadPdfForTab(tabId, book) {
     if (!pdfjsReady) { await initPdfJs(); if (!pdfjsReady) return; }
 
     try {
-        const pdfData = await invoke('read_pdf_file', { filePath: book.filePath });
-        const data = new Uint8Array(pdfData);
-        const doc = await pdfjsLib.getDocument({ data }).promise;
+        const pdfUrl = convertFileSrc(book.filePath);
+        const doc = await pdfjsLib.getDocument({ url: pdfUrl }).promise;
 
         const state = pdfStates[tabId];
         if (!state) return;
@@ -782,17 +781,17 @@ function sortBooks(books, sortBy) {
     });
 }
 
-async function renderGridView(grid, books) {
+function renderGridView(grid, books) {
     const fragment = document.createDocumentFragment();
 
     for (const book of books) {
-        fragment.appendChild(await createBookCard(book));
+        fragment.appendChild(createBookCard(book));
     }
     grid.innerHTML = '';
     grid.appendChild(fragment);
 }
 
-async function renderStacksView(grid, books) {
+function renderStacksView(grid, books) {
     grid.innerHTML = '';
 
     // Group books by tags
@@ -833,7 +832,7 @@ async function renderStacksView(grid, books) {
             cards.style.gridTemplateColumns = `repeat(auto-fill, minmax(${bookshelfCardSize}px, 1fr))`;
             cards.style.gap = '20px';
             for (const book of group.books) {
-                cards.appendChild(await createBookCard(book));
+                cards.appendChild(createBookCard(book));
             }
             stackEl.appendChild(cards);
         } else {
@@ -845,8 +844,7 @@ async function renderStacksView(grid, books) {
                 const cover = document.createElement('div');
                 cover.className = 'stacked-cover';
                 if (book.coverPath) {
-                    const dataUrl = await invoke('get_cover_data', { coverPath: book.coverPath });
-                    if (dataUrl) cover.innerHTML = `<img src="${dataUrl}" alt="">`;
+                    cover.innerHTML = `<img src="${convertFileSrc(book.coverPath)}" alt="">`;
                 }
                 preview.appendChild(cover);
             }
@@ -889,7 +887,7 @@ async function renderStacksView(grid, books) {
             cards.style.display = 'grid';
             cards.style.gridTemplateColumns = `repeat(auto-fill, minmax(${bookshelfCardSize}px, 1fr))`;
             cards.style.gap = '20px';
-            for (const book of untagged) cards.appendChild(await createBookCard(book));
+            for (const book of untagged) cards.appendChild(createBookCard(book));
             stackEl.appendChild(cards);
         }
 
@@ -915,7 +913,7 @@ function toggleListSort(col) {
     renderBooks();
 }
 
-async function renderListView(grid, books) {
+function renderListView(grid, books) {
     grid.innerHTML = '';
     const table = document.createElement('div');
     table.className = 'book-list';
@@ -987,17 +985,14 @@ async function toggleFavorite(bookId) {
     renderBooks();
 }
 
-async function createBookCard(book) {
+function createBookCard(book) {
     const card = document.createElement('div');
     card.className = 'book-card';
     card.dataset.id = book.id;
 
     let coverHtml;
     if (book.coverPath) {
-        const dataUrl = await invoke('get_cover_data', { coverPath: book.coverPath });
-        coverHtml = dataUrl
-            ? `<img class="book-cover" src="${dataUrl}" alt="${escapeHtml(book.title)}" loading="lazy">`
-            : placeholderHtml(book.title);
+        coverHtml = `<img class="book-cover" src="${convertFileSrc(book.coverPath)}" alt="${escapeHtml(book.title)}" loading="lazy">`;
     } else {
         coverHtml = placeholderHtml(book.title);
     }
