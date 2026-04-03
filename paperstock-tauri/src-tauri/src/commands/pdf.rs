@@ -1,10 +1,12 @@
 use std::path::Path;
 
 use base64::Engine;
+use tauri::ipc::Response;
 
 #[tauri::command]
-pub fn read_pdf_file(file_path: String) -> Result<Vec<u8>, String> {
-    std::fs::read(&file_path).map_err(|e| e.to_string())
+pub fn read_pdf_file(file_path: String) -> Result<Response, String> {
+    let data = std::fs::read(&file_path).map_err(|e| e.to_string())?;
+    Ok(Response::new(data))
 }
 
 #[tauri::command]

@@ -3,7 +3,7 @@
    Tab-based bookshelf + enhanced PDF viewer
    ══════════════════════════════════════════════════════ */
 
-const { invoke, convertFileSrc } = window.__TAURI__.core;
+const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const { getCurrentWebviewWindow } = window.__TAURI__.webviewWindow;
 
@@ -284,8 +284,9 @@ async function loadPdfForTab(tabId, book) {
     if (!pdfjsReady) { await initPdfJs(); if (!pdfjsReady) return; }
 
     try {
-        const pdfUrl = convertFileSrc(book.filePath);
-        const doc = await pdfjsLib.getDocument({ url: pdfUrl }).promise;
+        const pdfData = await invoke('read_pdf_file', { filePath: book.filePath });
+        const data = new Uint8Array(pdfData);
+        const doc = await pdfjsLib.getDocument({ data }).promise;
 
         const state = pdfStates[tabId];
         if (!state) return;
@@ -844,7 +845,11 @@ function renderStacksView(grid, books) {
                 const cover = document.createElement('div');
                 cover.className = 'stacked-cover';
                 if (book.coverPath) {
-                    cover.innerHTML = `<img src="${convertFileSrc(book.coverPath)}" alt="">`;
+                    const img = document.createElement('img');
+                    cover.appendChild(img);
+                    invoke('get_cover_data', { coverPath: book.coverPath }).then(dataUrl => {
+                        if (dataUrl) img.src = dataUrl;
+                    });
                 }
                 preview.appendChild(cover);
             }
@@ -992,7 +997,7 @@ function createBookCard(book) {
 
     let coverHtml;
     if (book.coverPath) {
-        coverHtml = `<img class="book-cover" src="${convertFileSrc(book.coverPath)}" alt="${escapeHtml(book.title)}" loading="lazy">`;
+        coverHtml = `<img class="book-cover" data-cover-path="${escapeHtml(book.coverPath)}" alt="${escapeHtml(book.title)}" loading="lazy">`;
     } else {
         coverHtml = placeholderHtml(book.title);
     }
@@ -1030,6 +1035,15 @@ function createBookCard(book) {
     card.addEventListener('contextmenu', (e) => {
         e.preventDefault(); showContextMenu(e.clientX, e.clientY, book.id);
     });
+
+    // Lazy load cover image
+    const coverImg = card.querySelector('img[data-cover-path]');
+    if (coverImg) {
+        invoke('get_cover_data', { coverPath: book.coverPath }).then(dataUrl => {
+            if (dataUrl) coverImg.src = dataUrl;
+        });
+    }
+
     return card;
 }
 
