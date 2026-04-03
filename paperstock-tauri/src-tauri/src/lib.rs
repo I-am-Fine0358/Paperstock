@@ -69,6 +69,12 @@ pub fn run() {
             commands::pdf::get_cover_data,
         ])
         .setup(|app| {
+            // Allow asset protocol to serve PDFs and covers
+            let user_data = dirs::data_dir().unwrap().join("Paperstock");
+            let scopes = app.state::<tauri::scope::Scopes>();
+            let _ = scopes.allow_directory(&user_data.join("pdfs"), true);
+            let _ = scopes.allow_directory(&user_data.join("covers"), true);
+
             let menu = menu::build_menu(app.handle())?;
             app.set_menu(menu)?;
 
