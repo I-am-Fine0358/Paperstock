@@ -1,0 +1,16 @@
+{
+  "identifier": "default",
+  "description": "Default capabilities for Paperstock",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "dialog:allow-open",
+    "dialog:allow-message",
+    "dialog:allow-ask",
+    "shell:allow-open",
+    "fs:default",
+    "fs:allow-read",
+    "fs:allow-write"
+  ]
+}

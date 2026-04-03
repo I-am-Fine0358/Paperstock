@@ -1,0 +1,13 @@
+{
+  "name": "paperstock",
+  "version": "2.0.0",
+  "private": true,
+  "scripts": {
+    "dev": "cargo tauri dev",
+    "build": "cargo tauri build",
+    "build:dmg": "cargo tauri build --bundles dmg"
+  },
+  "dependencies": {
+    "pdfjs-dist": "^5.5.207"
+  }
+}

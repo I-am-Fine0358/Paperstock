@@ -1,0 +1,330 @@
+/* ══════════════════════════════════════════════════════
+   Paperstock — PDF Viewer Styles
+   ══════════════════════════════════════════════════════ */
+
+:root {
+    --viewer-bg: #525659;
+    --toolbar-bg: rgba(30, 30, 30, 0.92);
+    --toolbar-border: rgba(255, 255, 255, 0.08);
+    --sidebar-bg: rgba(40, 40, 40, 0.95);
+    --text-light: #e5e5ea;
+    --text-dim: #8e8e93;
+    --accent: #007aff;
+    --font: 'Noto Sans JP', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    --transition: 0.2s cubic-bezier(0.25, 0.1, 0.25, 1);
+    --toolbar-height: 48px;
+    --sidebar-width: 180px;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: var(--font);
+    background: var(--viewer-bg);
+    color: var(--text-light);
+    height: 100vh;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    -webkit-font-smoothing: antialiased;
+    user-select: none;
+}
+
+::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+}
+
+::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.15);
+    border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.25);
+}
+
+/* ─── Toolbar ─── */
+.viewer-toolbar {
+    height: var(--toolbar-height);
+    background: var(--toolbar-bg);
+    backdrop-filter: blur(20px) saturate(1.8);
+    border-bottom: 1px solid var(--toolbar-border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 12px;
+    flex-shrink: 0;
+    -webkit-app-region: drag;
+    padding-top: 4px;
+    z-index: 10;
+}
+
+.toolbar-section {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    -webkit-app-region: no-drag;
+}
+
+.toolbar-left {
+    flex: 1;
+    min-width: 0;
+    padding-left: 64px;
+    /* Space for traffic lights */
+}
+
+.toolbar-center {
+    flex-shrink: 0;
+}
+
+.toolbar-right {
+    flex: 1;
+    justify-content: flex-end;
+}
+
+.viewer-title {
+    font-size: 13px;
+    font-weight: 500;
+    color: var(--text-light);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    margin-left: 8px;
+}
+
+.tool-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    border: none;
+    background: none;
+    border-radius: 6px;
+    cursor: pointer;
+    color: var(--text-light);
+    transition: all var(--transition);
+}
+
+.tool-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+}
+
+.tool-btn:active {
+    background: rgba(255, 255, 255, 0.15);
+}
+
+.tool-btn:disabled {
+    opacity: 0.3;
+    cursor: default;
+}
+
+.page-indicator {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 13px;
+    color: var(--text-dim);
+}
+
+.page-indicator input {
+    width: 44px;
+    padding: 3px 6px;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 5px;
+    color: var(--text-light);
+    font-family: var(--font);
+    font-size: 13px;
+    text-align: center;
+    outline: none;
+    appearance: textfield;
+    -moz-appearance: textfield;
+    transition: all var(--transition);
+}
+
+.page-indicator input::-webkit-inner-spin-button,
+.page-indicator input::-webkit-outer-spin-button {
+    -webkit-appearance: none;
+}
+
+.page-indicator input:focus {
+    border-color: var(--accent);
+    background: rgba(255, 255, 255, 0.12);
+}
+
+.zoom-level {
+    font-size: 12px;
+    color: var(--text-dim);
+    min-width: 40px;
+    text-align: center;
+}
+
+.toolbar-divider {
+    width: 1px;
+    height: 20px;
+    background: rgba(255, 255, 255, 0.1);
+    margin: 0 4px;
+}
+
+/* ─── Sidebar ─── */
+.viewer-sidebar {
+    position: fixed;
+    top: var(--toolbar-height);
+    left: 0;
+    bottom: 0;
+    width: var(--sidebar-width);
+    background: var(--sidebar-bg);
+    backdrop-filter: blur(20px);
+    border-right: 1px solid var(--toolbar-border);
+    transform: translateX(-100%);
+    transition: transform 0.25s cubic-bezier(0.25, 0.1, 0.25, 1);
+    z-index: 5;
+    overflow-y: auto;
+}
+
+.viewer-sidebar.open {
+    transform: translateX(0);
+}
+
+.sidebar-content {
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.thumbnail-item {
+    cursor: pointer;
+    border-radius: 6px;
+    padding: 4px;
+    transition: all var(--transition);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.thumbnail-item:hover {
+    background: rgba(255, 255, 255, 0.06);
+}
+
+.thumbnail-item.active {
+    background: rgba(0, 122, 255, 0.15);
+}
+
+.thumbnail-canvas {
+    width: 100%;
+    border-radius: 4px;
+    box-shadow: 0 1px 4px rgba(0, 0, 0, 0.3);
+}
+
+.thumbnail-label {
+    font-size: 10px;
+    color: var(--text-dim);
+    margin-top: 4px;
+}
+
+.thumbnail-item.active .thumbnail-label {
+    color: var(--accent);
+}
+
+/* ─── Viewer Container ─── */
+.viewer-container {
+    flex: 1;
+    overflow: auto;
+    display: flex;
+    justify-content: center;
+    background: var(--viewer-bg);
+    transition: margin-left 0.25s cubic-bezier(0.25, 0.1, 0.25, 1);
+}
+
+.viewer-container.sidebar-open {
+    margin-left: var(--sidebar-width);
+}
+
+.viewer-pages {
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+}
+
+.page-wrapper {
+    position: relative;
+    background: white;
+    box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
+    border-radius: 2px;
+}
+
+.page-canvas {
+    display: block;
+}
+
+/* ─── Loading ─── */
+.viewer-loading {
+    position: fixed;
+    inset: 0;
+    background: var(--viewer-bg);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 16px;
+    z-index: 100;
+    transition: opacity 0.3s ease;
+}
+
+.viewer-loading.hidden {
+    opacity: 0;
+    pointer-events: none;
+}
+
+.loading-spinner-viewer {
+    width: 36px;
+    height: 36px;
+    border: 3px solid rgba(255, 255, 255, 0.15);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.viewer-loading p {
+    font-size: 14px;
+    color: var(--text-dim);
+}
+
+/* ─── Text Layer (for selection) ─── */
+.text-layer {
+    position: absolute;
+    inset: 0;
+    overflow: hidden;
+    opacity: 0.2;
+    line-height: 1;
+}
+
+.text-layer>span {
+    color: transparent;
+    position: absolute;
+    white-space: pre;
+    transform-origin: 0% 0%;
+}
+
+.text-layer ::selection {
+    background: rgba(0, 122, 255, 0.3);
+}
