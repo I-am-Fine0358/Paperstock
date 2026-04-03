@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct Book {
     pub id: i64,
     pub title: String,
@@ -24,6 +25,7 @@ pub struct Tag {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct Comment {
     pub id: i64,
     pub book_id: i64,
@@ -37,6 +39,7 @@ pub struct Comment {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct Bookmark {
     pub id: i64,
     pub book_id: i64,
@@ -48,6 +51,7 @@ pub struct Bookmark {
 // Input/Update structs for commands
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BookUpdate {
     pub title: Option<String>,
     pub cover_path: Option<String>,
@@ -73,6 +77,7 @@ impl Default for BookUpdate {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct CommentInput {
     pub book_id: i64,
     pub page_num: i64,
@@ -89,6 +94,7 @@ pub struct CommentUpdate {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct BookmarkInput {
     pub book_id: i64,
     pub page_num: i64,

@@ -87,7 +87,7 @@ function openPdfTab(bookId) {
     const updates = { lastOpenedAt: new Date().toISOString() };
     if (book.status === 'unread') updates.status = 'reading';
     invoke('update_book', { id: bookId, updates });
-    book.last_opened_at = updates.lastOpenedAt;
+    book.lastOpenedAt = updates.lastOpenedAt;
     if (updates.status) book.status = updates.status;
     renderBooks();
 
@@ -107,7 +107,7 @@ function closeTab(tabId) {
         if (state.loaded && state.bookId) {
             invoke('update_book', { id: state.bookId, updates: { lastPage: state.currentPage } });
             const book = allBooks.find(b => b.id === state.bookId);
-            if (book) book.last_page = state.currentPage;
+            if (book) book.lastPage = state.currentPage;
         }
         if (state.pdfDoc) state.pdfDoc.destroy();
         delete pdfStates[tabId];
@@ -263,7 +263,7 @@ async function loadPdfForTab(tabId, book) {
     pdfStates[tabId] = {
         title: book.title,
         pdfDoc: null,
-        currentPage: book.last_page || 1,
+        currentPage: book.lastPage || 1,
         totalPages: 0,
         scale: 1.0,
         fitMode: true,
@@ -284,7 +284,7 @@ async function loadPdfForTab(tabId, book) {
     if (!pdfjsReady) { await initPdfJs(); if (!pdfjsReady) return; }
 
     try {
-        const pdfData = await invoke('read_pdf_file', { filePath: book.file_path });
+        const pdfData = await invoke('read_pdf_file', { filePath: book.filePath });
         const data = new Uint8Array(pdfData);
         const doc = await pdfjsLib.getDocument({ data }).promise;
 
@@ -438,7 +438,7 @@ async function createRenderedPage(state, pageNum, tabId) {
         await page.render({ canvasContext: ctx, viewport }).promise;
 
         // Add comment markers for this page
-        const pageComments = (state.comments || []).filter(c => c.page_num === pageNum);
+        const pageComments = (state.comments || []).filter(c => c.pageNum === pageNum);
         for (const comment of pageComments) {
             const marker = document.createElement('div');
             marker.className = 'comment-marker' + (comment.content ? ' has-content' : '');
@@ -490,7 +490,7 @@ function openCommentPopup(comment, x, y, tabId) {
     editingCommentId = comment.id;
     editingCommentTabId = tabId;
     const popup = document.getElementById('comment-popup');
-    popup.querySelector('.comment-popup-page').textContent = `ページ ${comment.page_num}`;
+    popup.querySelector('.comment-popup-page').textContent = `ページ ${comment.pageNum}`;
     document.getElementById('comment-text').value = comment.content || '';
     popup.style.display = 'block';
     popup.style.left = Math.min(x + 10, window.innerWidth - 280) + 'px';
@@ -713,8 +713,8 @@ async function renderBooks() {
     } else if (currentFilter === 'favorites') {
         books = books.filter(b => b.favorite);
     } else if (currentFilter === 'recent-opened') {
-        books = books.filter(b => b.last_opened_at);
-        books.sort((a, b) => (b.last_opened_at || '').localeCompare(a.last_opened_at || ''));
+        books = books.filter(b => b.lastOpenedAt);
+        books.sort((a, b) => (b.lastOpenedAt || '').localeCompare(a.lastOpenedAt || ''));
     } else if (currentFilter === 'status-unread') {
         books = books.filter(b => b.status === 'unread');
     } else if (currentFilter === 'status-reading') {
@@ -763,10 +763,10 @@ function sortBooks(books, sortBy) {
                 cmp = a.title.localeCompare(b.title, 'ja');
                 break;
             case 'created_at':
-                cmp = (a.created_at || '').localeCompare(b.created_at || '');
+                cmp = (a.createdAt || '').localeCompare(b.createdAt || '');
                 break;
             case 'page_count':
-                cmp = (a.page_count || 0) - (b.page_count || 0);
+                cmp = (a.pageCount || 0) - (b.pageCount || 0);
                 break;
             case 'status': {
                 const order = { reading: 0, unread: 1, completed: 2 };
@@ -775,7 +775,7 @@ function sortBooks(books, sortBy) {
             }
             case 'updated_at':
             default:
-                cmp = (a.updated_at || '').localeCompare(b.updated_at || '');
+                cmp = (a.updatedAt || '').localeCompare(b.updatedAt || '');
                 break;
         }
         return cmp * dir;
@@ -844,8 +844,8 @@ async function renderStacksView(grid, books) {
             for (const book of previewBooks) {
                 const cover = document.createElement('div');
                 cover.className = 'stacked-cover';
-                if (book.cover_path) {
-                    const dataUrl = await invoke('get_cover_data', { coverPath: book.cover_path });
+                if (book.coverPath) {
+                    const dataUrl = await invoke('get_cover_data', { coverPath: book.coverPath });
                     if (dataUrl) cover.innerHTML = `<img src="${dataUrl}" alt="">`;
                 }
                 preview.appendChild(cover);
@@ -942,7 +942,7 @@ async function renderListView(grid, books) {
 
         const statusLabel = book.status === 'reading' ? '読書中' : book.status === 'completed' ? '読了' : '未読';
         const statusClass = book.status || 'unread';
-        const dateStr = book.updated_at ? new Date(book.updated_at).toLocaleDateString('ja-JP') : '';
+        const dateStr = book.updatedAt ? new Date(book.updatedAt).toLocaleDateString('ja-JP') : '';
         const favClass = book.favorite ? 'fav-active' : '';
 
         row.innerHTML = `
@@ -955,7 +955,7 @@ async function renderListView(grid, books) {
             </span>
             <span class="list-col-title">${escapeHtml(book.title)}</span>
             <span class="list-col-status"><span class="status-pill ${statusClass}">${statusLabel}</span></span>
-            <span class="list-col-pages">${book.page_count || '-'}</span>
+            <span class="list-col-pages">${book.pageCount || '-'}</span>
             <span class="list-col-date">${dateStr}</span>
         `;
 
@@ -993,8 +993,8 @@ async function createBookCard(book) {
     card.dataset.id = book.id;
 
     let coverHtml;
-    if (book.cover_path) {
-        const dataUrl = await invoke('get_cover_data', { coverPath: book.cover_path });
+    if (book.coverPath) {
+        const dataUrl = await invoke('get_cover_data', { coverPath: book.coverPath });
         coverHtml = dataUrl
             ? `<img class="book-cover" src="${dataUrl}" alt="${escapeHtml(book.title)}" loading="lazy">`
             : placeholderHtml(book.title);
@@ -1360,7 +1360,7 @@ function hideContextMenu() { document.getElementById('context-menu').style.displ
 async function toggleBookmark() {
     const state = pdfStates[activeTabId];
     if (!state) return;
-    const existing = state.bookmarks.find(b => b.page_num === state.currentPage);
+    const existing = state.bookmarks.find(b => b.pageNum === state.currentPage);
     if (existing) {
         await invoke('delete_bookmark', { id: existing.id });
         state.bookmarks = state.bookmarks.filter(b => b.id !== existing.id);
@@ -1375,7 +1375,7 @@ function updateBookmarkButton() {
     const state = pdfStates[activeTabId];
     if (!state) return;
     const btn = document.getElementById('btn-bookmark');
-    const isBookmarked = state.bookmarks.some(b => b.page_num === state.currentPage);
+    const isBookmarked = state.bookmarks.some(b => b.pageNum === state.currentPage);
     btn.classList.toggle('active', isBookmarked);
     if (isBookmarked) {
         btn.querySelector('svg').setAttribute('fill', 'currentColor');
@@ -1402,7 +1402,7 @@ function showBookmarkDropdown() {
 
             // Render basic UI
             item.innerHTML = `
-                <span class="bookmark-page">P.${bm.page_num}</span>
+                <span class="bookmark-page">P.${bm.pageNum}</span>
                 <span class="bookmark-label">${escapeHtml(bm.label || '栞')}</span>
                 <button class="bookmark-delete" title="削除">×</button>
             `;
@@ -1410,7 +1410,7 @@ function showBookmarkDropdown() {
             // Navigation
             item.addEventListener('click', (e) => {
                 if (e.target.closest('.bookmark-delete') || e.target.tagName === 'INPUT') return;
-                state.currentPage = bm.page_num;
+                state.currentPage = bm.pageNum;
                 renderPdfPages(activeTabId);
                 hideBookmarkDropdown();
             });
@@ -1490,7 +1490,7 @@ async function handleContextAction(action) {
         case 'manage-tags': openTagAssignModal(contextBookId); break;
         case 'show-in-finder': {
             const book = allBooks.find(b => b.id === contextBookId);
-            if (book) invoke('show_in_finder', { filePath: book.file_path });
+            if (book) invoke('show_in_finder', { filePath: book.filePath });
             break;
         }
         case 'delete': {
