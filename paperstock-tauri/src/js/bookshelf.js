@@ -3,7 +3,7 @@
    Tab-based bookshelf + enhanced PDF viewer
    ══════════════════════════════════════════════════════ */
 
-const { invoke } = window.__TAURI__.core;
+const { invoke, convertFileSrc } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const { getCurrentWebviewWindow } = window.__TAURI__.webviewWindow;
 
@@ -63,14 +63,29 @@ async function loadData() {
 
 async function initPdfJs() {
     try {
-        const module = await import('./libs/pdf.mjs');
+        // Tauri serves .mjs with wrong MIME type, so use fetch + blob URL workaround
+        const resp = await fetch('./libs/pdf.mjs');
+        const code = await resp.text();
+        const blob = new Blob([code], { type: 'application/javascript' });
+        const blobUrl = URL.createObjectURL(blob);
+        const module = await import(blobUrl);
+        URL.revokeObjectURL(blobUrl);
         pdfjsLib = module;
-        pdfjsLib.GlobalWorkerOptions.workerSrc = './libs/pdf.worker.mjs';
+
+        // Worker also needs blob URL workaround
+        const wResp = await fetch('./libs/pdf.worker.mjs');
+        const wCode = await wResp.text();
+        const wBlob = new Blob([wCode], { type: 'application/javascript' });
+        const wBlobUrl = URL.createObjectURL(wBlob);
+        pdfjsLib.GlobalWorkerOptions.workerSrc = wBlobUrl;
+
         pdfjsReady = true;
     } catch (e) {
         console.error('Failed to initialize PDF.js:', e);
+        pdfjsInitError = String(e.message || e);
     }
 }
+let pdfjsInitError = '';
 
 // ══════════════════════════════════════════════════════
 //  TAB MANAGEMENT
@@ -281,12 +296,32 @@ async function loadPdfForTab(tabId, book) {
         document.getElementById('viewer-title').textContent = book.title;
     }
 
-    if (!pdfjsReady) { await initPdfJs(); if (!pdfjsReady) return; }
+    const loadingEl = document.getElementById('viewer-loading');
+    const showStep = (msg) => { if (loadingEl) loadingEl.querySelector('p').textContent = msg; };
+
+    if (!pdfjsReady) {
+        showStep('PDF.js初期化中…');
+        await initPdfJs();
+        if (!pdfjsReady) {
+            if (loadingEl) loadingEl.innerHTML = `<p style="color:#ff3b30">PDF.js初期化失敗</p><p style="color:#999;font-size:11px;max-width:500px;word-break:break-all;padding:0 20px">${pdfjsInitError}</p>`;
+            return;
+        }
+    }
 
     try {
-        const pdfData = await invoke('read_pdf_file', { filePath: book.filePath });
-        const data = new Uint8Array(pdfData);
-        const doc = await pdfjsLib.getDocument({ data }).promise;
+        showStep('PDF読み込み中…');
+        let doc;
+        try {
+            // Try asset protocol (fast, streaming)
+            const pdfUrl = convertFileSrc(book.filePath);
+            doc = await pdfjsLib.getDocument({ url: pdfUrl }).promise;
+        } catch (_e) {
+            // Fallback: read via fs plugin IPC
+            showStep('ファイル転送中…');
+            const { readFile } = window.__TAURI__.fs;
+            const pdfData = await readFile(book.filePath);
+            doc = await pdfjsLib.getDocument({ data: pdfData }).promise;
+        }
 
         const state = pdfStates[tabId];
         if (!state) return;
@@ -317,6 +352,7 @@ async function loadPdfForTab(tabId, book) {
           <line x1="9" y1="9" x2="15" y2="15"/>
         </svg>
         <p style="color:#ff3b30">PDFの読み込みに失敗しました</p>
+        <p style="color:#999;font-size:11px;max-width:400px;word-break:break-all">${String(err.message || err)}</p>
       `;
         }
     }

@@ -10,10 +10,11 @@
     "dialog:allow-ask",
     "shell:allow-open",
     "fs:default",
-    "fs:allow-read",
-    "fs:allow-write",
+    "fs:read-all",
+    "fs:write-all",
+    "fs:scope-app-recursive",
     {
-      "identifier": "fs:allow-read",
+      "identifier": "fs:scope",
       "allow": [
         { "path": "$APPDATA/**" },
         { "path": "$HOME/**" }
