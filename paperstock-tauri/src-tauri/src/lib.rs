@@ -1,12 +1,13 @@
-mod db;
-mod models;
-mod pdf_utils;
 mod commands;
+mod db;
 mod menu;
+mod models;
+mod pdf_server;
+mod pdf_utils;
 
 use db::BookDatabase;
 use std::fs;
-use tauri::{Emitter, Manager};
+use tauri::{Emitter, Manager, RunEvent};
 
 pub fn run() {
     let user_data = dirs::data_dir()
@@ -23,6 +24,7 @@ pub fn run() {
 
     // Initialize database
     let database = BookDatabase::new(db_path.to_str().unwrap());
+    let pdf_server = pdf_server::PdfServer::start().expect("Failed to start PDF server");
 
     // Migrate existing books to managed pdfs directory
     pdf_utils::migrate_existing_books(&database, pdfs_dir.to_str().unwrap());
@@ -32,7 +34,10 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_fs::init())
         .manage(database)
+        .manage(pdf_server)
         .invoke_handler(tauri::generate_handler![
+            // App
+            commands::app::quit_app,
             // Books
             commands::books::get_books,
             commands::books::get_books_by_tag,
@@ -65,7 +70,7 @@ pub fn run() {
             commands::files::set_custom_cover,
             commands::files::show_in_finder,
             // PDF
-            commands::pdf::read_pdf_file,
+            commands::pdf::get_pdf_stream_url,
             commands::pdf::get_cover_data,
         ])
         .setup(|app| {
@@ -78,24 +83,31 @@ pub fn run() {
             let menu = menu::build_menu(app.handle())?;
             app.set_menu(menu)?;
 
-            app.on_menu_event(|app, event| {
-                match event.id().as_ref() {
-                    "add-pdf" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.emit("menu-add-books", ());
-                        }
+            app.on_menu_event(|app, event| match event.id().as_ref() {
+                "add-pdf" => {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.emit("menu-add-books", ());
                     }
-                    "close-tab" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.emit("menu-close-tab", ());
-                        }
-                    }
-                    _ => {}
                 }
+                "close-tab" => {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.emit("menu-close-tab", ());
+                    }
+                }
+                _ => {}
             });
 
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running Paperstock");
+        .build(tauri::generate_context!())
+        .expect("error while building Paperstock")
+        .run(|app, event| {
+            if let RunEvent::Resumed = event {
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.emit("system-resumed", ());
+                    let _ = window
+                        .eval("window.dispatchEvent(new CustomEvent('paperstock-system-resumed'))");
+                }
+            }
+        });
 }

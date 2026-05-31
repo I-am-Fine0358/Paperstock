@@ -32,10 +32,7 @@ pub fn remove_book(db: State<BookDatabase>, id: i64) {
             let _ = std::fs::remove_file(cover_path);
         }
         // Delete PDF only if it resides in our managed pdfs directory
-        let pdfs_dir = dirs::data_dir()
-            .unwrap()
-            .join("Paperstock")
-            .join("pdfs");
+        let pdfs_dir = dirs::data_dir().unwrap().join("Paperstock").join("pdfs");
         if book.file_path.starts_with(pdfs_dir.to_str().unwrap_or("")) {
             let _ = std::fs::remove_file(&book.file_path);
         }

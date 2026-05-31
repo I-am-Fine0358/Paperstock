@@ -1,6 +1,6 @@
-use std::process::Command;
-use std::path::{Path, PathBuf};
 use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Extract cover image from PDF using macOS qlmanage
 pub fn extract_cover(pdf_path: &str, output_dir: &str, book_id: i64) -> Option<String> {
@@ -94,15 +94,19 @@ pub fn migrate_existing_books(db: &crate::db::BookDatabase, pdfs_dir: &str) {
                 let mut dest_path = PathBuf::from(pdfs_dir).join(&basename);
 
                 if dest_path.exists() {
-                    let stem = Path::new(&basename).file_stem()
-                        .unwrap_or_default().to_string_lossy().to_string();
-                    let ext = Path::new(&basename).extension()
+                    let stem = Path::new(&basename)
+                        .file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    let ext = Path::new(&basename)
+                        .extension()
                         .map(|e| format!(".{}", e.to_string_lossy()))
                         .unwrap_or_default();
                     let mut suffix = 1;
                     while dest_path.exists() {
-                        dest_path = PathBuf::from(pdfs_dir)
-                            .join(format!("{}_{}{}", stem, suffix, ext));
+                        dest_path =
+                            PathBuf::from(pdfs_dir).join(format!("{}_{}{}", stem, suffix, ext));
                         suffix += 1;
                     }
                 }
@@ -110,10 +114,13 @@ pub fn migrate_existing_books(db: &crate::db::BookDatabase, pdfs_dir: &str) {
                 match fs::copy(&book.file_path, &dest_path) {
                     Ok(_) => {
                         use crate::models::BookUpdate;
-                        db.update_book(book.id, &BookUpdate {
-                            file_path: Some(dest_path.to_string_lossy().to_string()),
-                            ..Default::default()
-                        });
+                        db.update_book(
+                            book.id,
+                            &BookUpdate {
+                                file_path: Some(dest_path.to_string_lossy().to_string()),
+                                ..Default::default()
+                            },
+                        );
                     }
                     Err(e) => {
                         eprintln!("Failed to migrate PDF for book {}: {}", book.id, e);

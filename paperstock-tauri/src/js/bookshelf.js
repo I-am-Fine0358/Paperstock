@@ -3,7 +3,7 @@
    Tab-based bookshelf + enhanced PDF viewer
    ══════════════════════════════════════════════════════ */
 
-const { invoke, convertFileSrc } = window.__TAURI__.core;
+const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const { getCurrentWebviewWindow } = window.__TAURI__.webviewWindow;
 
@@ -42,9 +42,14 @@ let commentMode = false;
 let editingCommentId = null;
 let editingCommentTabId = null;
 
+// Theme (night mode)
+let nightMode = localStorage.getItem('ps-night-mode') === '1';
+
 // ── Init ─────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
+    applyTheme();
     await loadData();
+    restoreTabState();
     // Apply saved bookshelf card size
     const grid = document.getElementById('book-grid');
     grid.style.gridTemplateColumns = `repeat(auto-fill, minmax(${bookshelfCardSize}px, 1fr))`;
@@ -53,12 +58,105 @@ document.addEventListener('DOMContentLoaded', async () => {
     renderTags();
     renderTabBar();
     setupEventListeners();
+    setupProgressBar();
     initPdfJs();
+    if (activeTabId !== 'bookshelf') activateTab(activeTabId);
 });
+
+function applyTheme() {
+    document.body.classList.toggle('night-mode', nightMode);
+}
+
+function toggleTheme() {
+    nightMode = !nightMode;
+    localStorage.setItem('ps-night-mode', nightMode ? '1' : '0');
+    applyTheme();
+    // Re-render the active PDF so the canvas filter reflects the new mode
+    if (activeTabId !== 'bookshelf' && pdfStates[activeTabId]?.loaded) {
+        renderPdfPages(activeTabId, true);
+    }
+}
+
+// Invert near-grayscale pixels (text, paper) while leaving colored pixels alone.
+// Makes paper black, dark text light, and preserves color photos/diagrams.
+function applyNightFilterToCanvas(canvas, ctx) {
+    const w = canvas.width, h = canvas.height;
+    if (w === 0 || h === 0) return;
+    let imgData;
+    try { imgData = ctx.getImageData(0, 0, w, h); } catch (_e) { return; }
+    const d = imgData.data;
+    const COLOR_THRESHOLD = 50; // max-min RGB delta below this counts as "near-grayscale"
+    for (let i = 0; i < d.length; i += 4) {
+        const r = d[i], g = d[i + 1], b = d[i + 2];
+        const max = r > g ? (r > b ? r : b) : (g > b ? g : b);
+        const min = r < g ? (r < b ? r : b) : (g < b ? g : b);
+        if (max - min < COLOR_THRESHOLD) {
+            d[i] = 255 - r;
+            d[i + 1] = 255 - g;
+            d[i + 2] = 255 - b;
+        }
+    }
+    ctx.putImageData(imgData, 0, 0);
+}
 
 async function loadData() {
     allBooks = await invoke('get_books');
     allTags = await invoke('get_tags');
+}
+
+// ── Tab state persistence ──────────────────────────────
+// Tabs and groups are saved to localStorage on every change so the sidebar
+// survives app restart. PDFs are NOT auto-loaded on startup — the saved tab
+// is just a stub; loadPdfForTab runs lazily the first time the user clicks it.
+function persistTabState() {
+    try {
+        const data = {
+            tabs: tabs.map(t => ({ id: t.id, type: t.type, bookId: t.bookId, title: t.title, groupId: t.groupId })),
+            tabGroups: tabGroups.map(g => ({ id: g.id, name: g.name, color: g.color, collapsed: !!g.collapsed })),
+            activeTabId,
+            nextTabId,
+            nextGroupId,
+        };
+        localStorage.setItem('ps-tab-state', JSON.stringify(data));
+    } catch (_e) { /* localStorage may be full; ignore */ }
+}
+
+function restoreTabState() {
+    let raw;
+    try { raw = localStorage.getItem('ps-tab-state'); } catch (_e) { return; }
+    if (!raw) return;
+    let data;
+    try { data = JSON.parse(raw); } catch (_e) { return; }
+
+    tabGroups = Array.isArray(data.tabGroups) ? data.tabGroups : [];
+    const validGroupIds = new Set(tabGroups.map(g => g.id));
+
+    const validBookIds = new Set(allBooks.map(b => b.id));
+    tabs = (Array.isArray(data.tabs) ? data.tabs : [])
+        .filter(t => t && t.type === 'pdf' && validBookIds.has(t.bookId))
+        .map(t => {
+            const book = allBooks.find(b => b.id === t.bookId);
+            return {
+                id: t.id,
+                type: 'pdf',
+                bookId: t.bookId,
+                title: book ? book.title : t.title, // sync with possibly-renamed book
+                groupId: validGroupIds.has(t.groupId) ? t.groupId : null,
+            };
+        });
+
+    // Make sure nextTabId/nextGroupId are past any restored ids to avoid collisions
+    const maxTabNum = tabs.reduce((m, t) => {
+        const n = parseInt(String(t.id).replace(/^pdf-/, ''));
+        return Number.isFinite(n) && n > m ? n : m;
+    }, 0);
+    const maxGroupId = tabGroups.reduce((m, g) => g.id > m ? g.id : m, 0);
+    nextTabId = Math.max(data.nextTabId || 1, maxTabNum + 1);
+    nextGroupId = Math.max(data.nextGroupId || 1, maxGroupId + 1);
+
+    if (data.activeTabId && (data.activeTabId === 'bookshelf' || tabs.some(t => t.id === data.activeTabId))) {
+        activeTabId = data.activeTabId;
+    }
 }
 
 async function initPdfJs() {
@@ -108,21 +206,19 @@ function openPdfTab(bookId) {
 
     const tabId = 'pdf-' + nextTabId++;
     tabs.push({ id: tabId, type: 'pdf', bookId, title: book.title, groupId: null });
-    activateTab(tabId);
+    activateTab(tabId); // lazy-loads via loadPdfForTab when pdfStates entry is missing
     renderTabBar();
-    loadPdfForTab(tabId, book);
 }
 
-function closeTab(tabId) {
+async function closeTab(tabId) {
     const idx = tabs.findIndex(t => t.id === tabId);
     if (idx === -1) return;
     if (pdfStates[tabId]) {
-        // Save last page before closing
         const state = pdfStates[tabId];
+        // Cancel any pending debounced save and persist final state synchronously
+        if (saveStateTimers[tabId]) { clearTimeout(saveStateTimers[tabId]); delete saveStateTimers[tabId]; }
         if (state.loaded && state.bookId) {
-            invoke('update_book', { id: state.bookId, updates: { lastPage: state.currentPage } });
-            const book = allBooks.find(b => b.id === state.bookId);
-            if (book) book.lastPage = state.currentPage;
+            try { await saveBookState(tabId); } catch (_e) { /* best-effort */ }
         }
         if (state.pdfDoc) state.pdfDoc.destroy();
         delete pdfStates[tabId];
@@ -130,6 +226,209 @@ function closeTab(tabId) {
     tabs.splice(idx, 1);
     if (activeTabId === tabId) activateTab('bookshelf');
     renderTabBar();
+}
+
+// ── Reading Progress Bar ───────────────────────────────
+let progressBarSide = localStorage.getItem('ps-progress-side') || 'right';
+
+function getProgressForState(state) {
+    // For spread mode, treat each spread as one "step" with a representative current.
+    // We always anchor on currentPage so spread/single share the same logic.
+    const total = state.totalPages;
+    const cur = state.currentPage;
+    const ratio = total > 1 ? (cur - 1) / (total - 1) : (total === 1 ? 1 : 0);
+    return { ratio, cur, total };
+}
+
+function showProgressBar(visible) {
+    const el = document.getElementById('reading-progress');
+    if (!el) return;
+    el.style.display = visible ? 'flex' : 'none';
+    if (visible) el.dataset.side = progressBarSide;
+}
+
+function updateProgressBar(tabId) {
+    const bar = document.getElementById('reading-progress');
+    if (!bar) return;
+    const state = pdfStates[tabId];
+    if (!state || !state.loaded || tabId !== activeTabId) {
+        showProgressBar(false);
+        return;
+    }
+    showProgressBar(true);
+    bar.dataset.side = progressBarSide;
+
+    const { ratio, cur, total } = getProgressForState(state);
+    const pct = Math.max(0, Math.min(1, ratio)) * 100;
+    document.getElementById('rp-fill').style.height = pct + '%';
+    document.getElementById('rp-thumb').style.top = pct + '%';
+
+    // Tooltip default position aligned with current
+    const tooltip = document.getElementById('rp-tooltip');
+    tooltip.textContent = `P. ${cur} / ${total}`;
+    tooltip.style.top = pct + '%';
+    tooltip.style.transform = 'translateY(-50%)';
+
+    // Render bookmark + comment markers
+    const markersEl = document.getElementById('rp-markers');
+    markersEl.innerHTML = '';
+    if (total > 1) {
+        const placed = new Set();
+        for (const bm of (state.bookmarks || [])) {
+            const r = (bm.pageNum - 1) / (total - 1);
+            const m = document.createElement('div');
+            m.className = 'rp-marker bookmark';
+            m.style.top = Math.max(0, Math.min(1, r)) * 100 + '%';
+            m.title = `栞: P.${bm.pageNum}`;
+            markersEl.appendChild(m);
+            placed.add(bm.pageNum);
+        }
+        // Comments: dedup pages so we don't stack many at same spot
+        const commentPages = new Set();
+        for (const c of (state.comments || [])) {
+            if (placed.has(c.pageNum)) continue;
+            commentPages.add(c.pageNum);
+        }
+        for (const p of commentPages) {
+            const r = (p - 1) / (total - 1);
+            const m = document.createElement('div');
+            m.className = 'rp-marker comment';
+            m.style.top = Math.max(0, Math.min(1, r)) * 100 + '%';
+            m.title = `コメント: P.${p}`;
+            markersEl.appendChild(m);
+        }
+    }
+}
+
+function pageFromPointer(clientY, trackEl, total) {
+    const rect = trackEl.getBoundingClientRect();
+    const r = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
+    if (total <= 1) return 1;
+    return Math.max(1, Math.min(total, Math.round(1 + r * (total - 1))));
+}
+
+function setupProgressBar() {
+    const bar = document.getElementById('reading-progress');
+    const track = document.getElementById('rp-track');
+    const tooltip = document.getElementById('rp-tooltip');
+    if (!bar || !track) return;
+
+    let dragging = false;
+    let lastHoverPage = null;
+
+    const updateHoverTooltip = (clientY) => {
+        const state = pdfStates[activeTabId];
+        if (!state || !state.loaded) return;
+        const page = pageFromPointer(clientY, track, state.totalPages);
+        const trackRect = track.getBoundingClientRect();
+        const localY = clientY - trackRect.top;
+        const pct = (localY / trackRect.height) * 100;
+        tooltip.textContent = `P. ${page} / ${state.totalPages}`;
+        tooltip.style.top = Math.max(0, Math.min(100, pct)) + '%';
+        tooltip.style.transform = 'translateY(-50%)';
+        lastHoverPage = page;
+    };
+
+    bar.addEventListener('mousemove', (e) => updateHoverTooltip(e.clientY));
+
+    bar.addEventListener('mousedown', (e) => {
+        if (e.button !== 0) return;
+        const state = pdfStates[activeTabId];
+        if (!state || !state.loaded) return;
+        e.preventDefault();
+        dragging = true;
+        bar.classList.add('dragging');
+        updateHoverTooltip(e.clientY);
+
+        const onMove = (ev) => {
+            if (!dragging) return;
+            updateHoverTooltip(ev.clientY);
+        };
+        const onUp = (ev) => {
+            window.removeEventListener('mousemove', onMove);
+            window.removeEventListener('mouseup', onUp);
+            if (!dragging) return;
+            dragging = false;
+            bar.classList.remove('dragging');
+            const s = pdfStates[activeTabId];
+            if (!s || !s.loaded) return;
+            const page = pageFromPointer(ev.clientY, track, s.totalPages);
+            if (page !== s.currentPage) {
+                s.currentPage = page;
+                renderPdfPages(activeTabId);
+                saveBookState(activeTabId);
+            } else {
+                updateProgressBar(activeTabId);
+            }
+        };
+        window.addEventListener('mousemove', onMove);
+        window.addEventListener('mouseup', onUp);
+    });
+
+    // Right-click toggles left/right placement
+    bar.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        progressBarSide = progressBarSide === 'right' ? 'left' : 'right';
+        localStorage.setItem('ps-progress-side', progressBarSide);
+        bar.dataset.side = progressBarSide;
+    });
+}
+
+// ── Reading-state persistence ──────────────────────────
+// Saves currentPage, scroll position (as ratio), zoom and spread mode for the
+// book in the given tab. Called on every navigation, zoom, scroll, spread toggle,
+// and tab close. Fire-and-forget by default; await in closeTab/beforeunload.
+const saveStateTimers = {};
+
+function saveBookState(tabId) {
+    const state = pdfStates[tabId];
+    if (!state || !state.loaded || !state.bookId) return Promise.resolve();
+
+    const updates = {
+        lastPage: state.currentPage,
+        lastZoom: state.fitMode ? 0 : state.scale,
+        lastSpreadMode: state.spreadMode ? 1 : 0,
+    };
+
+    // Scroll position only meaningful for active tab (where DOM reflects state)
+    if (activeTabId === tabId) {
+        const viewerContainer = document.getElementById('viewer-container');
+        const pagesContainer = document.getElementById('viewer-pages');
+        if (pagesContainer && pagesContainer.scrollHeight > 0) {
+            updates.lastScrollY = viewerContainer.scrollTop / pagesContainer.scrollHeight;
+        }
+    }
+
+    // Update local cache so a subsequent re-open uses fresh values without an IPC round-trip
+    const book = allBooks.find(b => b.id === state.bookId);
+    if (book) {
+        book.lastPage = updates.lastPage;
+        book.lastZoom = updates.lastZoom;
+        book.lastSpreadMode = updates.lastSpreadMode;
+        if (updates.lastScrollY !== undefined) book.lastScrollY = updates.lastScrollY;
+    }
+
+    return invoke('update_book', { id: state.bookId, updates });
+}
+
+async function flushOpenPdfState() {
+    persistTabState();
+    for (const tabId of Object.keys(pdfStates)) {
+        if (saveStateTimers[tabId]) {
+            clearTimeout(saveStateTimers[tabId]);
+            delete saveStateTimers[tabId];
+        }
+        await saveBookState(tabId);
+    }
+}
+
+function scheduleSaveBookState(tabId, ms = 500) {
+    clearTimeout(saveStateTimers[tabId]);
+    saveStateTimers[tabId] = setTimeout(() => {
+        delete saveStateTimers[tabId];
+        saveBookState(tabId);
+    }, ms);
 }
 
 function activateTab(tabId) {
@@ -145,11 +444,24 @@ function activateTab(tabId) {
         bookshelfView.classList.add('active');
         viewerView.classList.remove('active');
         hideCommentPopup();
+        showProgressBar(false);
     } else {
         bookshelfView.classList.remove('active');
         viewerView.classList.add('active');
+        // Lazy-load: restored tabs (from previous session) have no pdfStates entry yet
+        if (!pdfStates[tabId]) {
+            const tab = tabs.find(t => t.id === tabId);
+            const book = tab ? allBooks.find(b => b.id === tab.bookId) : null;
+            if (!book) {
+                // Underlying book deleted while app was closed → drop the dead tab
+                closeTab(tabId);
+                return;
+            }
+            loadPdfForTab(tabId, book);
+        }
         showPdfTab(tabId);
     }
+    persistTabState();
 }
 
 function showPdfTab(tabId) {
@@ -158,6 +470,7 @@ function showPdfTab(tabId) {
 
     document.getElementById('viewer-title').textContent = state.title || '';
     document.getElementById('viewer-loading').style.display = state.loaded ? 'none' : 'flex';
+    if (!state.loaded) showProgressBar(false);
 
     // Update toolbar toggle states
     document.getElementById('btn-spread').classList.toggle('active', state.spreadMode || false);
@@ -187,8 +500,57 @@ function showPdfTab(tabId) {
         const sidebar = document.getElementById('viewer-sidebar');
         sidebar.classList.toggle('open', state.thumbnailsOpen || false);
 
-        renderPdfPages(tabId);
+        // If fit calc was deferred (loaded while viewer was hidden), recompute
+        // now that the container is laid out, then render.
+        if (state.fitNeedsRecompute) {
+            ensureFitScale(state).then(() => {
+                if (activeTabId === tabId) renderPdfPages(tabId);
+            });
+        } else {
+            renderPdfPages(tabId);
+        }
     }
+}
+
+let resumeRecoveryTimer = null;
+function scheduleResumeRecovery(_reason = 'resume') {
+    clearTimeout(resumeRecoveryTimer);
+    resumeRecoveryTimer = setTimeout(async () => {
+        document.body.classList.add('resume-repaint');
+        requestAnimationFrame(() => document.body.classList.remove('resume-repaint'));
+
+        applyTheme();
+
+        if (activeTabId === 'bookshelf') {
+            try { await loadData(); } catch (e) { console.warn('Failed to refresh bookshelf after resume:', e); }
+            renderBooks();
+            renderTags();
+            renderTabBar();
+            return;
+        }
+
+        const state = pdfStates[activeTabId];
+        if (!state) {
+            activateTab(activeTabId);
+            return;
+        }
+
+        if (state.loaded) {
+            if (state.fitMode) {
+                state.fitNeedsRecompute = true;
+                await ensureFitScale(state);
+            }
+            showPdfTab(activeTabId);
+            renderPdfPages(activeTabId, true);
+            return;
+        }
+
+        if (!state.loading) {
+            const tab = tabs.find(t => t.id === activeTabId);
+            const book = tab ? allBooks.find(b => b.id === tab.bookId) : null;
+            if (book) loadPdfForTab(activeTabId, book);
+        }
+    }, 150);
 }
 
 // Tab bar rendering (same as before)
@@ -245,6 +607,7 @@ function renderTabBar() {
         ungrouped.forEach(tab => div.appendChild(createTabElement(tab)));
         container.appendChild(div);
     }
+    persistTabState();
 }
 
 function createTabElement(tab) {
@@ -274,21 +637,54 @@ function createTabElement(tab) {
 //  PDF VIEWER — enhanced
 // ══════════════════════════════════════════════════════
 
+// Compute fit-to-width scale only when the viewer is actually laid out.
+// If the container is hidden (clientWidth = 0 — e.g. user switched to bookshelf
+// while the PDF was loading), set state.fitNeedsRecompute = true so the next
+// showPdfTab can retry once the container becomes visible.
+async function ensureFitScale(state) {
+    if (!state || !state.fitMode || !state.pdfDoc) return;
+    const container = document.getElementById('viewer-container');
+    if (!container || container.clientWidth <= 0) {
+        state.fitNeedsRecompute = true;
+        return;
+    }
+    try {
+        const page = await state.pdfDoc.getPage(1);
+        const viewport = page.getViewport({ scale: 1.0 });
+        const w = container.clientWidth - 60;
+        if (w > 0 && viewport.width > 0) {
+            state.scale = w / viewport.width;
+            state.fitNeedsRecompute = false;
+        } else {
+            state.fitNeedsRecompute = true;
+        }
+    } catch (_e) {
+        state.fitNeedsRecompute = true;
+    }
+}
+
 async function loadPdfForTab(tabId, book) {
+    // Guard against duplicate concurrent calls for the same tab (openPdfTab + activateTab lazy-load).
+    if (pdfStates[tabId] && pdfStates[tabId].loading) return;
+
+    const restoredZoom = book.lastZoom && book.lastZoom > 0 ? book.lastZoom : null;
     pdfStates[tabId] = {
         title: book.title,
         pdfDoc: null,
         currentPage: book.lastPage || 1,
         totalPages: 0,
-        scale: 1.0,
-        fitMode: true,
+        scale: restoredZoom || 1.0,
+        fitMode: !restoredZoom, // if no saved zoom, use fit-to-width default
+        fitNeedsRecompute: !restoredZoom,
         thumbnailsOpen: false,
         loaded: false,
+        loading: true,
         bookId: book.id,
-        spreadMode: false,
-        scrollDir: 'vertical', // 'vertical' | 'horizontal'
+        spreadMode: !!book.lastSpreadMode,
+        scrollDir: 'vertical',
         comments: [],
         bookmarks: [],
+        pendingScrollY: book.lastScrollY || 0, // ratio 0-1, applied after first render
     };
 
     if (activeTabId === tabId) {
@@ -310,18 +706,8 @@ async function loadPdfForTab(tabId, book) {
 
     try {
         showStep('PDF読み込み中…');
-        let doc;
-        try {
-            // Try asset protocol (fast, streaming)
-            const pdfUrl = convertFileSrc(book.filePath);
-            doc = await pdfjsLib.getDocument({ url: pdfUrl }).promise;
-        } catch (_e) {
-            // Fallback: read via fs plugin IPC
-            showStep('ファイル転送中…');
-            const { readFile } = window.__TAURI__.fs;
-            const pdfData = await readFile(book.filePath);
-            doc = await pdfjsLib.getDocument({ data: pdfData }).promise;
-        }
+        const pdfUrl = await invoke('get_pdf_stream_url', { filePath: book.filePath });
+        const doc = await pdfjsLib.getDocument({ url: pdfUrl }).promise;
 
         const state = pdfStates[tabId];
         if (!state) return;
@@ -334,16 +720,15 @@ async function loadPdfForTab(tabId, book) {
         state.comments = await invoke('get_comments', { bookId: book.id });
         state.bookmarks = await invoke('get_bookmarks', { bookId: book.id });
 
-        // Calculate fit-width scale
-        const page = await doc.getPage(1);
-        const viewport = page.getViewport({ scale: 1.0 });
-        const container = document.getElementById('viewer-container');
-        const containerWidth = container.clientWidth - 60;
-        state.scale = containerWidth / viewport.width;
+        // Compute fit-width only if container is visible right now; otherwise
+        // showPdfTab will retry once the user switches back.
+        await ensureFitScale(state);
 
+        state.loading = false;
         if (activeTabId === tabId) showPdfTab(tabId);
     } catch (err) {
         console.error('Failed to load PDF:', err);
+        if (pdfStates[tabId]) pdfStates[tabId].loading = false;
         if (pdfStates[tabId] && activeTabId === tabId) {
             const loading = document.getElementById('viewer-loading');
             loading.innerHTML = `
@@ -361,6 +746,12 @@ async function loadPdfForTab(tabId, book) {
 async function renderPdfPages(tabId, preserveScroll = false) {
     const state = pdfStates[tabId];
     if (!state || !state.pdfDoc || tabId !== activeTabId) return;
+
+    // Safety net: never let an invalid scale through to PDF.js viewport math.
+    if (!state.scale || state.scale <= 0 || !Number.isFinite(state.scale)) {
+        state.scale = 1.0;
+        state.fitNeedsRecompute = state.fitMode;
+    }
 
     const pagesContainer = document.getElementById('viewer-pages');
     const viewerContainer = document.getElementById('viewer-container');
@@ -411,6 +802,10 @@ async function renderPdfPages(tabId, preserveScroll = false) {
         // Restore scroll position based on ratio
         viewerContainer.scrollLeft = scrollRatioX * pagesContainer.scrollWidth;
         viewerContainer.scrollTop = scrollRatioY * pagesContainer.scrollHeight;
+    } else if (state.pendingScrollY && pagesContainer.scrollHeight > 0) {
+        // Restore previously-saved scroll on first render after open
+        viewerContainer.scrollTop = state.pendingScrollY * pagesContainer.scrollHeight;
+        state.pendingScrollY = 0;
     } else {
         viewerContainer.scrollTop = 0;
         viewerContainer.scrollLeft = 0;
@@ -418,6 +813,7 @@ async function renderPdfPages(tabId, preserveScroll = false) {
 
     updateThumbnailHighlight(tabId);
     updateBookmarkButton();
+    updateProgressBar(tabId);
 }
 
 async function renderSinglePage(tabId, container, state) {
@@ -463,7 +859,7 @@ async function createRenderedPage(state, pageNum, tabId) {
         const canvas = document.createElement('canvas');
         canvas.className = 'page-canvas';
         const ctx = canvas.getContext('2d');
-        const dpr = window.devicePixelRatio || 1;
+        const dpr = Math.min(window.devicePixelRatio || 1, 2);
         canvas.width = viewport.width * dpr;
         canvas.height = viewport.height * dpr;
         canvas.style.width = viewport.width + 'px';
@@ -472,6 +868,8 @@ async function createRenderedPage(state, pageNum, tabId) {
         wrapper.appendChild(canvas);
 
         await page.render({ canvasContext: ctx, viewport }).promise;
+
+        if (nightMode) applyNightFilterToCanvas(canvas, ctx);
 
         // Add comment markers for this page
         const pageComments = (state.comments || []).filter(c => c.pageNum === pageNum);
@@ -584,8 +982,7 @@ function viewerNav(delta) {
         state.currentPage = Math.max(1, Math.min(state.currentPage + delta, state.totalPages));
     }
     renderPdfPages(activeTabId, true);
-    // Persist last page
-    if (state.bookId) invoke('update_book', { id: state.bookId, updates: { lastPage: state.currentPage } });
+    saveBookState(activeTabId);
 }
 
 function viewerSetZoom(newScale) {
@@ -595,6 +992,7 @@ function viewerSetZoom(newScale) {
     state.fitMode = false;
     updateViewerZoomSlider(state);
     renderPdfPages(activeTabId);
+    scheduleSaveBookState(activeTabId);
 }
 
 function viewerZoomIn() { const s = pdfStates[activeTabId]; if (s) viewerSetZoom(s.scale * 1.2); }
@@ -664,6 +1062,7 @@ function toggleSpreadMode() {
         } else { renderPdfPages(activeTabId); }
     }
     else renderPdfPages(activeTabId);
+    saveBookState(activeTabId);
 }
 
 function toggleScrollDirection() {
@@ -684,7 +1083,11 @@ function viewerToggleThumbnails() {
     if (!state) return;
     state.thumbnailsOpen = !state.thumbnailsOpen;
     document.getElementById('viewer-sidebar').classList.toggle('open', state.thumbnailsOpen);
-    if (state.thumbnailsOpen) generateThumbnails(activeTabId);
+    if (state.thumbnailsOpen) {
+        generateThumbnails(activeTabId);
+    } else {
+        document.getElementById('thumbnail-list').innerHTML = '';
+    }
 }
 
 async function generateThumbnails(tabId) {
@@ -692,7 +1095,7 @@ async function generateThumbnails(tabId) {
     if (!state || !state.pdfDoc) return;
     const list = document.getElementById('thumbnail-list');
     list.innerHTML = '';
-    const max = Math.min(state.totalPages, 200);
+    const max = Math.min(state.totalPages, 80);
     for (let i = 1; i <= max; i++) {
         const item = document.createElement('div');
         item.className = 'thumbnail-item' + (i === state.currentPage ? ' active' : '');
@@ -705,7 +1108,7 @@ async function generateThumbnails(tabId) {
         item.appendChild(canvas);
         item.appendChild(label);
         list.appendChild(item);
-        item.addEventListener('click', () => { state.currentPage = i; renderPdfPages(tabId); });
+        item.addEventListener('click', () => { state.currentPage = i; renderPdfPages(tabId); saveBookState(tabId); });
     }
     for (let i = 1; i <= max; i++) {
         const canvas = list.children[i - 1]?.querySelector('canvas');
@@ -713,11 +1116,12 @@ async function generateThumbnails(tabId) {
         try {
             const page = await state.pdfDoc.getPage(i);
             const vp = page.getViewport({ scale: 0.2 });
-            const dpr = window.devicePixelRatio || 1;
+            const dpr = 1;
             canvas.width = vp.width * dpr; canvas.height = vp.height * dpr;
             canvas.style.width = vp.width + 'px'; canvas.style.height = vp.height + 'px';
             const ctx = canvas.getContext('2d'); ctx.scale(dpr, dpr);
             await page.render({ canvasContext: ctx, viewport: vp }).promise;
+            if (nightMode) applyNightFilterToCanvas(canvas, ctx);
         } catch (e) { /* skip */ }
     }
 }
@@ -759,9 +1163,10 @@ async function renderBooks() {
         books = books.filter(b => b.status === 'completed');
     }
 
-    // Search
-    const query = document.getElementById('search-input').value.trim().toLowerCase();
-    if (query) books = books.filter(b => b.title.toLowerCase().includes(query));
+    // Search (NFKC normalize + lowercase + strip whitespace)
+    const rawQuery = document.getElementById('search-input').value;
+    const query = normalizeForSearch(rawQuery);
+    if (query) books = books.filter(b => normalizeForSearch(b.title).includes(query));
 
     // Sort (skip for recent-opened which has its own sort)
     if (currentFilter !== 'recent-opened') {
@@ -1168,13 +1573,38 @@ function setFilter(type, tagId = null, tagName = '') {
 function setupEventListeners() {
     document.getElementById('tab-bookshelf').addEventListener('click', () => activateTab('bookshelf'));
     document.getElementById('btn-add-books').addEventListener('click', addBooks);
+    document.getElementById('btn-theme-toggle').addEventListener('click', toggleTheme);
     listen('menu-add-books', () => { addBooks(); });
     listen('menu-close-tab', () => { if (activeTabId !== 'bookshelf') closeTab(activeTabId); });
+    listen('system-resumed', () => scheduleResumeRecovery('system-resumed'));
 
     let searchTimeout;
-    document.getElementById('search-input').addEventListener('input', () => {
+    const searchInput = document.getElementById('search-input');
+    const searchBox = searchInput.closest('.search-box');
+    const searchClear = document.getElementById('search-clear');
+    const updateSearchClearState = () => {
+        searchBox.classList.toggle('has-value', searchInput.value.length > 0);
+    };
+    searchInput.addEventListener('input', () => {
+        updateSearchClearState();
         clearTimeout(searchTimeout); searchTimeout = setTimeout(renderBooks, 200);
     });
+    searchInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && searchInput.value) {
+            e.preventDefault();
+            e.stopPropagation();
+            searchInput.value = '';
+            updateSearchClearState();
+            renderBooks();
+        }
+    });
+    searchClear.addEventListener('click', () => {
+        searchInput.value = '';
+        updateSearchClearState();
+        renderBooks();
+        searchInput.focus();
+    });
+    updateSearchClearState();
 
     document.getElementById('nav-all').addEventListener('click', () => setFilter('all'));
     document.getElementById('nav-recent').addEventListener('click', () => setFilter('recent'));
@@ -1219,11 +1649,14 @@ function setupEventListeners() {
     // Tauri drag-and-drop API
     getCurrentWebviewWindow().onDragDropEvent(async (event) => {
         if (event.payload.type === 'drop') {
+            dragCounter = 0;
+            dropOverlay.classList.remove('active');
             const pdfPaths = event.payload.paths.filter(p => p.toLowerCase().endsWith('.pdf'));
             if (pdfPaths.length > 0) await importFiles(pdfPaths);
-        } else if (event.payload.type === 'enter') {
+        } else if (event.payload.type === 'enter' || event.payload.type === 'over') {
             dropOverlay.classList.add('active');
-        } else if (event.payload.type === 'leave') {
+        } else if (event.payload.type === 'leave' || event.payload.type === 'cancelled') {
+            dragCounter = 0;
             dropOverlay.classList.remove('active');
         }
     });
@@ -1299,6 +1732,61 @@ function setupEventListeners() {
         document.getElementById('btn-fit').title = '縦に合わせる';
         document.getElementById('zoom-level').textContent = vzSlider.value + '%';
         renderPdfPages(activeTabId);
+        scheduleSaveBookState(activeTabId);
+    });
+
+    // Persist scroll position (debounced)
+    document.getElementById('viewer-container').addEventListener('scroll', () => {
+        if (activeTabId === 'bookshelf') return;
+        const state = pdfStates[activeTabId];
+        if (!state || !state.loaded) return;
+        scheduleSaveBookState(activeTabId, 400);
+    }, { passive: true });
+
+    // Best-effort persist on app close: flush every open tab's state
+    window.addEventListener('beforeunload', () => {
+        persistTabState();
+        for (const tabId of Object.keys(pdfStates)) {
+            if (saveStateTimers[tabId]) clearTimeout(saveStateTimers[tabId]);
+            saveBookState(tabId);
+        }
+    });
+
+    let isClosingWindow = false;
+    if (getCurrentWebviewWindow()?.onCloseRequested) {
+        getCurrentWebviewWindow().onCloseRequested(async (event) => {
+            if (isClosingWindow) return;
+            event.preventDefault();
+            isClosingWindow = true;
+
+            const appWindow = getCurrentWebviewWindow();
+            try {
+                await flushOpenPdfState();
+            } finally {
+                try {
+                    if (await appWindow.isFullscreen?.()) {
+                        await appWindow.setFullscreen(false);
+                    }
+                } catch (_e) { /* best-effort before closing */ }
+
+                try {
+                    await invoke('quit_app');
+                } catch (_e) {
+                    if (appWindow.destroy) {
+                        await appWindow.destroy();
+                    } else {
+                        await appWindow.close();
+                    }
+                }
+            }
+        });
+    }
+
+    window.addEventListener('pageshow', () => scheduleResumeRecovery('pageshow'));
+    window.addEventListener('focus', () => scheduleResumeRecovery('focus'));
+    window.addEventListener('paperstock-system-resumed', () => scheduleResumeRecovery('paperstock-system-resumed'));
+    document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'visible') scheduleResumeRecovery('visibilitychange');
     });
 
     // Comment popup
@@ -1315,8 +1803,11 @@ function setupEventListeners() {
         const state = pdfStates[activeTabId];
         if (!state) return;
         const num = parseInt(pageInput.value);
-        if (num >= 1 && num <= state.totalPages) { state.currentPage = num; renderPdfPages(activeTabId); }
-        else pageInput.value = state.currentPage;
+        if (num >= 1 && num <= state.totalPages) {
+            state.currentPage = num;
+            renderPdfPages(activeTabId);
+            saveBookState(activeTabId);
+        } else pageInput.value = state.currentPage;
     });
     pageInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') pageInput.blur(); });
 
@@ -1414,6 +1905,7 @@ async function toggleBookmark() {
         state.bookmarks.push(bm);
     }
     updateBookmarkButton();
+    updateProgressBar(activeTabId);
 }
 
 function updateBookmarkButton() {
@@ -1457,6 +1949,7 @@ function showBookmarkDropdown() {
                 if (e.target.closest('.bookmark-delete') || e.target.tagName === 'INPUT') return;
                 state.currentPage = bm.pageNum;
                 renderPdfPages(activeTabId);
+                saveBookState(activeTabId);
                 hideBookmarkDropdown();
             });
 
@@ -1709,4 +2202,11 @@ function escapeHtml(str) {
     const div = document.createElement('div');
     div.textContent = str;
     return div.innerHTML;
+}
+
+// Normalize a string for fuzzy title matching: NFKC fold (full-width → half-width),
+// lowercase, strip all whitespace (including no-break spaces, ideographic spaces).
+function normalizeForSearch(s) {
+    if (!s) return '';
+    return s.normalize('NFKC').toLowerCase().replace(/\s+/g, '');
 }

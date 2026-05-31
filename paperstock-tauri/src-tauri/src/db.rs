@@ -67,18 +67,14 @@ impl BookDatabase {
         .expect("Failed to create tables");
 
         // Migration: add status column if missing
-        let has_status: bool = conn
-            .prepare("SELECT status FROM books LIMIT 1")
-            .is_ok();
+        let has_status: bool = conn.prepare("SELECT status FROM books LIMIT 1").is_ok();
         if !has_status {
             conn.execute_batch("ALTER TABLE books ADD COLUMN status TEXT DEFAULT 'unread'")
                 .expect("Failed to add status column");
         }
 
         // Migration: add favorite column if missing
-        let has_favorite: bool = conn
-            .prepare("SELECT favorite FROM books LIMIT 1")
-            .is_ok();
+        let has_favorite: bool = conn.prepare("SELECT favorite FROM books LIMIT 1").is_ok();
         if !has_favorite {
             conn.execute_batch("ALTER TABLE books ADD COLUMN favorite INTEGER DEFAULT 0")
                 .expect("Failed to add favorite column");
@@ -94,12 +90,35 @@ impl BookDatabase {
         }
 
         // Migration: add last_page column if missing
-        let has_last_page: bool = conn
-            .prepare("SELECT last_page FROM books LIMIT 1")
-            .is_ok();
+        let has_last_page: bool = conn.prepare("SELECT last_page FROM books LIMIT 1").is_ok();
         if !has_last_page {
             conn.execute_batch("ALTER TABLE books ADD COLUMN last_page INTEGER DEFAULT 1")
                 .expect("Failed to add last_page column");
+        }
+
+        // Migration: add last_scroll_y column if missing (scroll ratio 0.0-1.0)
+        let has_last_scroll_y: bool = conn
+            .prepare("SELECT last_scroll_y FROM books LIMIT 1")
+            .is_ok();
+        if !has_last_scroll_y {
+            conn.execute_batch("ALTER TABLE books ADD COLUMN last_scroll_y REAL DEFAULT 0")
+                .expect("Failed to add last_scroll_y column");
+        }
+
+        // Migration: add last_zoom column if missing (0 = use fit-default)
+        let has_last_zoom: bool = conn.prepare("SELECT last_zoom FROM books LIMIT 1").is_ok();
+        if !has_last_zoom {
+            conn.execute_batch("ALTER TABLE books ADD COLUMN last_zoom REAL DEFAULT 0")
+                .expect("Failed to add last_zoom column");
+        }
+
+        // Migration: add last_spread_mode column if missing (0 = single, 1 = spread)
+        let has_last_spread_mode: bool = conn
+            .prepare("SELECT last_spread_mode FROM books LIMIT 1")
+            .is_ok();
+        if !has_last_spread_mode {
+            conn.execute_batch("ALTER TABLE books ADD COLUMN last_spread_mode INTEGER DEFAULT 0")
+                .expect("Failed to add last_spread_mode column");
         }
 
         Self {
@@ -131,7 +150,7 @@ impl BookDatabase {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, title, file_path, cover_path, page_count, status, favorite, last_opened_at, last_page, created_at, updated_at FROM books WHERE id = ?1",
+                "SELECT id, title, file_path, cover_path, page_count, status, favorite, last_opened_at, last_page, last_scroll_y, last_zoom, last_spread_mode, created_at, updated_at FROM books WHERE id = ?1",
             )
             .ok()?;
         let mut book = stmt
@@ -142,12 +161,17 @@ impl BookDatabase {
                     file_path: row.get(2)?,
                     cover_path: row.get(3)?,
                     page_count: row.get(4)?,
-                    status: row.get::<_, Option<String>>(5)?.unwrap_or_else(|| "unread".to_string()),
+                    status: row
+                        .get::<_, Option<String>>(5)?
+                        .unwrap_or_else(|| "unread".to_string()),
                     favorite: row.get::<_, Option<i64>>(6)?.unwrap_or(0),
                     last_opened_at: row.get(7)?,
                     last_page: row.get::<_, Option<i64>>(8)?.unwrap_or(1),
-                    created_at: row.get(9)?,
-                    updated_at: row.get(10)?,
+                    last_scroll_y: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
+                    last_zoom: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
+                    last_spread_mode: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
+                    created_at: row.get(12)?,
+                    updated_at: row.get(13)?,
                     tags: Vec::new(),
                 })
             })
@@ -161,7 +185,7 @@ impl BookDatabase {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, title, file_path, cover_path, page_count, status, favorite, last_opened_at, last_page, created_at, updated_at FROM books ORDER BY updated_at DESC",
+                "SELECT id, title, file_path, cover_path, page_count, status, favorite, last_opened_at, last_page, last_scroll_y, last_zoom, last_spread_mode, created_at, updated_at FROM books ORDER BY updated_at DESC",
             )
             .expect("Failed to prepare get_all_books");
         let books = stmt
@@ -172,12 +196,17 @@ impl BookDatabase {
                     file_path: row.get(2)?,
                     cover_path: row.get(3)?,
                     page_count: row.get(4)?,
-                    status: row.get::<_, Option<String>>(5)?.unwrap_or_else(|| "unread".to_string()),
+                    status: row
+                        .get::<_, Option<String>>(5)?
+                        .unwrap_or_else(|| "unread".to_string()),
                     favorite: row.get::<_, Option<i64>>(6)?.unwrap_or(0),
                     last_opened_at: row.get(7)?,
                     last_page: row.get::<_, Option<i64>>(8)?.unwrap_or(1),
-                    created_at: row.get(9)?,
-                    updated_at: row.get(10)?,
+                    last_scroll_y: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
+                    last_zoom: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
+                    last_spread_mode: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
+                    created_at: row.get(12)?,
+                    updated_at: row.get(13)?,
                     tags: Vec::new(),
                 })
             })
@@ -196,7 +225,7 @@ impl BookDatabase {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT b.id, b.title, b.file_path, b.cover_path, b.page_count, b.status, b.favorite, b.last_opened_at, b.last_page, b.created_at, b.updated_at FROM books b JOIN book_tags bt ON b.id = bt.book_id WHERE bt.tag_id = ?1 ORDER BY b.updated_at DESC",
+                "SELECT b.id, b.title, b.file_path, b.cover_path, b.page_count, b.status, b.favorite, b.last_opened_at, b.last_page, b.last_scroll_y, b.last_zoom, b.last_spread_mode, b.created_at, b.updated_at FROM books b JOIN book_tags bt ON b.id = bt.book_id WHERE bt.tag_id = ?1 ORDER BY b.updated_at DESC",
             )
             .expect("Failed to prepare get_books_by_tag");
         let books = stmt
@@ -207,12 +236,17 @@ impl BookDatabase {
                     file_path: row.get(2)?,
                     cover_path: row.get(3)?,
                     page_count: row.get(4)?,
-                    status: row.get::<_, Option<String>>(5)?.unwrap_or_else(|| "unread".to_string()),
+                    status: row
+                        .get::<_, Option<String>>(5)?
+                        .unwrap_or_else(|| "unread".to_string()),
                     favorite: row.get::<_, Option<i64>>(6)?.unwrap_or(0),
                     last_opened_at: row.get(7)?,
                     last_page: row.get::<_, Option<i64>>(8)?.unwrap_or(1),
-                    created_at: row.get(9)?,
-                    updated_at: row.get(10)?,
+                    last_scroll_y: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
+                    last_zoom: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
+                    last_spread_mode: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
+                    created_at: row.get(12)?,
+                    updated_at: row.get(13)?,
                     tags: Vec::new(),
                 })
             })
@@ -232,7 +266,7 @@ impl BookDatabase {
         let pattern = format!("%{}%", query);
         let mut stmt = conn
             .prepare(
-                "SELECT id, title, file_path, cover_path, page_count, status, favorite, last_opened_at, last_page, created_at, updated_at FROM books WHERE title LIKE ?1 ORDER BY updated_at DESC",
+                "SELECT id, title, file_path, cover_path, page_count, status, favorite, last_opened_at, last_page, last_scroll_y, last_zoom, last_spread_mode, created_at, updated_at FROM books WHERE title LIKE ?1 ORDER BY updated_at DESC",
             )
             .expect("Failed to prepare search_books");
         let books = stmt
@@ -243,12 +277,17 @@ impl BookDatabase {
                     file_path: row.get(2)?,
                     cover_path: row.get(3)?,
                     page_count: row.get(4)?,
-                    status: row.get::<_, Option<String>>(5)?.unwrap_or_else(|| "unread".to_string()),
+                    status: row
+                        .get::<_, Option<String>>(5)?
+                        .unwrap_or_else(|| "unread".to_string()),
                     favorite: row.get::<_, Option<i64>>(6)?.unwrap_or(0),
                     last_opened_at: row.get(7)?,
                     last_page: row.get::<_, Option<i64>>(8)?.unwrap_or(1),
-                    created_at: row.get(9)?,
-                    updated_at: row.get(10)?,
+                    last_scroll_y: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
+                    last_zoom: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
+                    last_spread_mode: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
+                    created_at: row.get(12)?,
+                    updated_at: row.get(13)?,
                     tags: Vec::new(),
                 })
             })
@@ -296,14 +335,23 @@ impl BookDatabase {
             fields.push("last_page = ?".to_string());
             values.push(Box::new(last_page));
         }
+        if let Some(last_scroll_y) = updates.last_scroll_y {
+            fields.push("last_scroll_y = ?".to_string());
+            values.push(Box::new(last_scroll_y));
+        }
+        if let Some(last_zoom) = updates.last_zoom {
+            fields.push("last_zoom = ?".to_string());
+            values.push(Box::new(last_zoom));
+        }
+        if let Some(last_spread_mode) = updates.last_spread_mode {
+            fields.push("last_spread_mode = ?".to_string());
+            values.push(Box::new(last_spread_mode));
+        }
 
         fields.push("updated_at = CURRENT_TIMESTAMP".to_string());
         values.push(Box::new(id));
 
-        let sql = format!(
-            "UPDATE books SET {} WHERE id = ?",
-            fields.join(", ")
-        );
+        let sql = format!("UPDATE books SET {} WHERE id = ?", fields.join(", "));
         let params: Vec<&dyn rusqlite::types::ToSql> = values.iter().map(|v| v.as_ref()).collect();
         conn.execute(&sql, params.as_slice())
             .expect("Failed to update book");
@@ -327,25 +375,33 @@ impl BookDatabase {
         )
         .expect("Failed to insert tag");
         let id = conn.last_insert_rowid();
-        conn.query_row("SELECT id, name, color FROM tags WHERE id = ?1", params![id], |row| {
-            Ok(Tag {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                color: row.get(2)?,
-            })
-        })
+        conn.query_row(
+            "SELECT id, name, color FROM tags WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(Tag {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    color: row.get(2)?,
+                })
+            },
+        )
         .expect("Failed to retrieve inserted tag")
     }
 
     pub fn get_tag(&self, id: i64) -> Option<Tag> {
         let conn = self.conn.lock().unwrap();
-        conn.query_row("SELECT id, name, color FROM tags WHERE id = ?1", params![id], |row| {
-            Ok(Tag {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                color: row.get(2)?,
-            })
-        })
+        conn.query_row(
+            "SELECT id, name, color FROM tags WHERE id = ?1",
+            params![id],
+            |row| {
+                Ok(Tag {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    color: row.get(2)?,
+                })
+            },
+        )
         .ok()
     }
 
