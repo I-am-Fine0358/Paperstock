@@ -121,6 +121,17 @@ impl BookDatabase {
                 .expect("Failed to add last_spread_mode column");
         }
 
+        // Migration: add last_spread_direction column if missing (0 = left-bound, 1 = right-bound)
+        let has_last_spread_direction: bool = conn
+            .prepare("SELECT last_spread_direction FROM books LIMIT 1")
+            .is_ok();
+        if !has_last_spread_direction {
+            conn.execute_batch(
+                "ALTER TABLE books ADD COLUMN last_spread_direction INTEGER DEFAULT 1",
+            )
+            .expect("Failed to add last_spread_direction column");
+        }
+
         Self {
             conn: Mutex::new(conn),
         }
@@ -150,7 +161,7 @@ impl BookDatabase {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, title, file_path, cover_path, page_count, status, favorite, last_opened_at, last_page, last_scroll_y, last_zoom, last_spread_mode, created_at, updated_at FROM books WHERE id = ?1",
+                "SELECT id, title, file_path, cover_path, page_count, status, favorite, last_opened_at, last_page, last_scroll_y, last_zoom, last_spread_mode, last_spread_direction, created_at, updated_at FROM books WHERE id = ?1",
             )
             .ok()?;
         let mut book = stmt
@@ -170,8 +181,9 @@ impl BookDatabase {
                     last_scroll_y: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
                     last_zoom: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
                     last_spread_mode: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
-                    created_at: row.get(12)?,
-                    updated_at: row.get(13)?,
+                    last_spread_direction: row.get::<_, Option<i64>>(12)?.unwrap_or(1),
+                    created_at: row.get(13)?,
+                    updated_at: row.get(14)?,
                     tags: Vec::new(),
                 })
             })
@@ -185,7 +197,7 @@ impl BookDatabase {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT id, title, file_path, cover_path, page_count, status, favorite, last_opened_at, last_page, last_scroll_y, last_zoom, last_spread_mode, created_at, updated_at FROM books ORDER BY updated_at DESC",
+                "SELECT id, title, file_path, cover_path, page_count, status, favorite, last_opened_at, last_page, last_scroll_y, last_zoom, last_spread_mode, last_spread_direction, created_at, updated_at FROM books ORDER BY updated_at DESC",
             )
             .expect("Failed to prepare get_all_books");
         let books = stmt
@@ -205,8 +217,9 @@ impl BookDatabase {
                     last_scroll_y: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
                     last_zoom: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
                     last_spread_mode: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
-                    created_at: row.get(12)?,
-                    updated_at: row.get(13)?,
+                    last_spread_direction: row.get::<_, Option<i64>>(12)?.unwrap_or(1),
+                    created_at: row.get(13)?,
+                    updated_at: row.get(14)?,
                     tags: Vec::new(),
                 })
             })
@@ -225,7 +238,7 @@ impl BookDatabase {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
             .prepare(
-                "SELECT b.id, b.title, b.file_path, b.cover_path, b.page_count, b.status, b.favorite, b.last_opened_at, b.last_page, b.last_scroll_y, b.last_zoom, b.last_spread_mode, b.created_at, b.updated_at FROM books b JOIN book_tags bt ON b.id = bt.book_id WHERE bt.tag_id = ?1 ORDER BY b.updated_at DESC",
+                "SELECT b.id, b.title, b.file_path, b.cover_path, b.page_count, b.status, b.favorite, b.last_opened_at, b.last_page, b.last_scroll_y, b.last_zoom, b.last_spread_mode, b.last_spread_direction, b.created_at, b.updated_at FROM books b JOIN book_tags bt ON b.id = bt.book_id WHERE bt.tag_id = ?1 ORDER BY b.updated_at DESC",
             )
             .expect("Failed to prepare get_books_by_tag");
         let books = stmt
@@ -245,8 +258,9 @@ impl BookDatabase {
                     last_scroll_y: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
                     last_zoom: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
                     last_spread_mode: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
-                    created_at: row.get(12)?,
-                    updated_at: row.get(13)?,
+                    last_spread_direction: row.get::<_, Option<i64>>(12)?.unwrap_or(1),
+                    created_at: row.get(13)?,
+                    updated_at: row.get(14)?,
                     tags: Vec::new(),
                 })
             })
@@ -266,7 +280,7 @@ impl BookDatabase {
         let pattern = format!("%{}%", query);
         let mut stmt = conn
             .prepare(
-                "SELECT id, title, file_path, cover_path, page_count, status, favorite, last_opened_at, last_page, last_scroll_y, last_zoom, last_spread_mode, created_at, updated_at FROM books WHERE title LIKE ?1 ORDER BY updated_at DESC",
+                "SELECT id, title, file_path, cover_path, page_count, status, favorite, last_opened_at, last_page, last_scroll_y, last_zoom, last_spread_mode, last_spread_direction, created_at, updated_at FROM books WHERE title LIKE ?1 ORDER BY updated_at DESC",
             )
             .expect("Failed to prepare search_books");
         let books = stmt
@@ -286,8 +300,9 @@ impl BookDatabase {
                     last_scroll_y: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
                     last_zoom: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
                     last_spread_mode: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
-                    created_at: row.get(12)?,
-                    updated_at: row.get(13)?,
+                    last_spread_direction: row.get::<_, Option<i64>>(12)?.unwrap_or(1),
+                    created_at: row.get(13)?,
+                    updated_at: row.get(14)?,
                     tags: Vec::new(),
                 })
             })
@@ -346,6 +361,10 @@ impl BookDatabase {
         if let Some(last_spread_mode) = updates.last_spread_mode {
             fields.push("last_spread_mode = ?".to_string());
             values.push(Box::new(last_spread_mode));
+        }
+        if let Some(last_spread_direction) = updates.last_spread_direction {
+            fields.push("last_spread_direction = ?".to_string());
+            values.push(Box::new(last_spread_direction));
         }
 
         fields.push("updated_at = CURRENT_TIMESTAMP".to_string());

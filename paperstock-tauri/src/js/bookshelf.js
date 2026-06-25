@@ -19,11 +19,19 @@ let allTags = [];
 let currentFilter = 'all';
 let currentTagId = null;
 let contextBookId = null;
-let viewMode = 'grid'; // 'grid' | 'list' | 'stacks'
+let viewMode = 'grid'; // 'grid' | 'list'
 let currentSort = localStorage.getItem('ps-sort') || 'updated_at';
 let sortAscending = localStorage.getItem('ps-sort-asc') === 'true';
-let stacksExpanded = {}; // tagId -> boolean
 let bookshelfCardSize = parseInt(localStorage.getItem('ps-card-size')) || 150;
+let manualBookStacks = [];
+let nextManualStackId = 1;
+let draggedBookId = null;
+let activeBookFolderRef = null;
+let suppressBookClickUntil = 0;
+let pointerBookDrag = null;
+const BOOK_FOLDER_PREVIEW_LIMIT = 9;
+const BOOK_STACKS_STORAGE_KEY = 'ps-book-stacks';
+const BOOK_STACK_DRAG_THRESHOLD = 8;
 
 // Tab system
 let tabs = [];
@@ -54,7 +62,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const grid = document.getElementById('book-grid');
     grid.style.gridTemplateColumns = `repeat(auto-fill, minmax(${bookshelfCardSize}px, 1fr))`;
     document.getElementById('bookshelf-zoom').value = bookshelfCardSize;
-    renderBooks();
+    await renderBooks();
     renderTags();
     renderTabBar();
     setupEventListeners();
@@ -102,6 +110,73 @@ function applyNightFilterToCanvas(canvas, ctx) {
 async function loadData() {
     allBooks = await invoke('get_books');
     allTags = await invoke('get_tags');
+    loadManualBookStacks();
+    sanitizeManualBookStacks();
+}
+
+function loadManualBookStacks() {
+    let raw;
+    try { raw = localStorage.getItem(BOOK_STACKS_STORAGE_KEY); } catch (_e) { return; }
+    if (!raw) return;
+    let parsed;
+    try { parsed = JSON.parse(raw); } catch (_e) { return; }
+    const stacks = Array.isArray(parsed?.stacks) ? parsed.stacks : Array.isArray(parsed) ? parsed : [];
+    manualBookStacks = stacks
+        .filter(stack => stack && Array.isArray(stack.bookIds))
+        .map(stack => ({
+            id: String(stack.id || `stack-${nextManualStackId++}`),
+            name: String(stack.name || 'スタック'),
+            color: stack.color || '#8e8e93',
+            bookIds: [...new Set(stack.bookIds.map(id => parseInt(id)).filter(Number.isFinite))],
+            createdAt: stack.createdAt || new Date().toISOString(),
+        }));
+    const maxIdNum = manualBookStacks.reduce((max, stack) => {
+        const n = parseInt(String(stack.id).replace(/^manual-/, '').replace(/^stack-/, ''));
+        return Number.isFinite(n) && n > max ? n : max;
+    }, 0);
+    nextManualStackId = Math.max(nextManualStackId, maxIdNum + 1);
+}
+
+function persistManualBookStacks() {
+    try {
+        localStorage.setItem(BOOK_STACKS_STORAGE_KEY, JSON.stringify({
+            stacks: manualBookStacks.map(stack => ({
+                id: stack.id,
+                name: stack.name,
+                color: stack.color,
+                bookIds: stack.bookIds,
+                createdAt: stack.createdAt,
+            })),
+        }));
+    } catch (_e) { /* localStorage may be full; ignore */ }
+}
+
+function sanitizeManualBookStacks() {
+    const validBookIds = new Set(allBooks.map(book => book.id));
+    const seenBookIds = new Set();
+    let changed = false;
+    manualBookStacks = manualBookStacks
+        .map(stack => {
+            const bookIds = [];
+            for (const bookId of stack.bookIds) {
+                if (!validBookIds.has(bookId) || seenBookIds.has(bookId)) {
+                    changed = true;
+                    continue;
+                }
+                seenBookIds.add(bookId);
+                bookIds.push(bookId);
+            }
+            if (bookIds.length !== stack.bookIds.length) changed = true;
+            return { ...stack, bookIds };
+        })
+        .filter(stack => {
+            if (stack.bookIds.length < 2) {
+                changed = true;
+                return false;
+            }
+            return true;
+        });
+    if (changed) persistManualBookStacks();
 }
 
 // ── Tab state persistence ──────────────────────────────
@@ -389,6 +464,7 @@ function saveBookState(tabId) {
         lastPage: state.currentPage,
         lastZoom: state.fitMode ? 0 : state.scale,
         lastSpreadMode: state.spreadMode ? 1 : 0,
+        lastSpreadDirection: getSpreadDirection(state) === 'rtl' ? 1 : 0,
     };
 
     // Scroll position only meaningful for active tab (where DOM reflects state)
@@ -406,6 +482,7 @@ function saveBookState(tabId) {
         book.lastPage = updates.lastPage;
         book.lastZoom = updates.lastZoom;
         book.lastSpreadMode = updates.lastSpreadMode;
+        book.lastSpreadDirection = updates.lastSpreadDirection;
         if (updates.lastScrollY !== undefined) book.lastScrollY = updates.lastScrollY;
     }
 
@@ -475,6 +552,8 @@ function showPdfTab(tabId) {
     // Update toolbar toggle states
     document.getElementById('btn-spread').classList.toggle('active', state.spreadMode || false);
     document.getElementById('btn-comment-mode').classList.toggle('active', commentMode);
+    updateSpreadDirectionButtonState(state);
+    updatePageNavigationState(state);
 
     const scrollBtn = document.getElementById('btn-scroll-dir');
     if (state.scrollDir === 'horizontal') {
@@ -494,8 +573,8 @@ function showPdfTab(tabId) {
         document.getElementById('page-input').value = state.currentPage;
         document.getElementById('page-input').max = state.totalPages;
         updateViewerZoomSlider(state);
-        document.getElementById('btn-prev').disabled = state.currentPage <= 1;
-        document.getElementById('btn-next').disabled = state.currentPage >= state.totalPages;
+        updateFitButtonState(state);
+        updatePageNavigationState(state);
 
         const sidebar = document.getElementById('viewer-sidebar');
         sidebar.classList.toggle('open', state.thumbnailsOpen || false);
@@ -536,8 +615,7 @@ function scheduleResumeRecovery(_reason = 'resume') {
         }
 
         if (state.loaded) {
-            if (state.fitMode) {
-                state.fitNeedsRecompute = true;
+            if (state.fitNeedsRecompute) {
                 await ensureFitScale(state);
             }
             showPdfTab(activeTabId);
@@ -637,23 +715,147 @@ function createTabElement(tab) {
 //  PDF VIEWER — enhanced
 // ══════════════════════════════════════════════════════
 
-// Compute fit-to-width scale only when the viewer is actually laid out.
+// Compute fit scale only when the viewer is actually laid out.
 // If the container is hidden (clientWidth = 0 — e.g. user switched to bookshelf
 // while the PDF was loading), set state.fitNeedsRecompute = true so the next
 // showPdfTab can retry once the container becomes visible.
+function getFitType(state) {
+    if (!state || !state.fitMode) return 'none';
+    return state.fitType || 'autoWidth';
+}
+
+function updateFitButtonState(state) {
+    const fitBtn = document.getElementById('btn-fit');
+    if (!fitBtn) return;
+
+    const fitType = getFitType(state);
+    fitBtn.classList.toggle('active', fitType !== 'none');
+
+    if (fitType === 'height') {
+        fitBtn.title = '縦に合わせ中 (もう1回で横に合わせる)';
+    } else if (fitType === 'width') {
+        fitBtn.title = '横に合わせ中 (もう1回で解除)';
+    } else if (fitType === 'autoWidth') {
+        fitBtn.title = '横幅に自動調整中 (クリックで縦に合わせる)';
+    } else {
+        fitBtn.title = '縦に合わせる';
+    }
+}
+
+function getSpreadDirection(state) {
+    return state?.spreadDirection === 'ltr' ? 'ltr' : 'rtl';
+}
+
+function isRightBoundSpread(state) {
+    return getSpreadDirection(state) === 'rtl';
+}
+
+function getSpreadAnchorPage(state) {
+    const total = Math.max(1, state?.totalPages || 1);
+    let page = Math.max(1, Math.min(state?.currentPage || 1, total));
+    if (page === 1) return 1;
+    if (page % 2 === 1) page -= 1;
+    return Math.max(2, page);
+}
+
+function getNavigationAnchorPage(state) {
+    if (!state) return 1;
+    if (state.spreadMode) return getSpreadAnchorPage(state);
+    return Math.max(1, Math.min(state.currentPage || 1, state.totalPages || state.currentPage || 1));
+}
+
+function getNavigationTargetPage(state, delta) {
+    if (!state || !state.totalPages) return 1;
+    if (state.spreadMode) {
+        const current = getSpreadAnchorPage(state);
+        const next = delta > 0
+            ? (current === 1 ? 2 : current + 2)
+            : (current <= 2 ? 1 : current - 2);
+        return Math.max(1, Math.min(next, state.totalPages));
+    }
+    return Math.max(1, Math.min((state.currentPage || 1) + delta, state.totalPages));
+}
+
+function getVisualNavigationDelta(state, side) {
+    const visualDelta = side === 'left' ? -1 : 1;
+    return state?.spreadMode && isRightBoundSpread(state) ? -visualDelta : visualDelta;
+}
+
+function updatePageNavigationState(state) {
+    const leftBtn = document.getElementById('btn-prev');
+    const rightBtn = document.getElementById('btn-next');
+    if (!leftBtn || !rightBtn || !state) return;
+
+    const current = getNavigationAnchorPage(state);
+    const leftDelta = getVisualNavigationDelta(state, 'left');
+    const rightDelta = getVisualNavigationDelta(state, 'right');
+    const leftIsNext = leftDelta > 0;
+    const rightIsNext = rightDelta > 0;
+
+    leftBtn.disabled = getNavigationTargetPage(state, leftDelta) === current;
+    rightBtn.disabled = getNavigationTargetPage(state, rightDelta) === current;
+    leftBtn.title = leftIsNext ? '次のページ' : '前のページ';
+    rightBtn.title = rightIsNext ? '次のページ' : '前のページ';
+    leftBtn.setAttribute('aria-label', leftBtn.title);
+    rightBtn.setAttribute('aria-label', rightBtn.title);
+}
+
+function updateSpreadDirectionButtonState(state) {
+    const btn = document.getElementById('btn-spread-direction');
+    if (!btn || !state) return;
+
+    const rtl = isRightBoundSpread(state);
+    btn.classList.toggle('active', rtl);
+    btn.title = rtl ? '右綴じ表示中 (クリックで左綴じ)' : '左綴じ表示中 (クリックで右綴じ)';
+    btn.setAttribute('aria-label', rtl ? '右綴じ表示' : '左綴じ表示');
+    btn.innerHTML = getSpreadDirectionIcon(rtl);
+}
+
+function getSpreadDirectionIcon(rtl) {
+    const spineX = rtl ? 20 : 4;
+    const arrowLine = rtl ? 'M16 12H8' : 'M8 12h8';
+    const arrowHead = rtl ? 'M11 9l-3 3 3 3' : 'M13 9l3 3-3 3';
+    return `
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+            stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="4" y="5" width="7" height="14" rx="1.2" />
+            <rect x="13" y="5" width="7" height="14" rx="1.2" />
+            <path d="M${spineX} 5v14" stroke-width="3" />
+            <path d="${arrowLine}" />
+            <path d="${arrowHead}" />
+        </svg>
+    `;
+}
+
 async function ensureFitScale(state) {
     if (!state || !state.fitMode || !state.pdfDoc) return;
     const container = document.getElementById('viewer-container');
-    if (!container || container.clientWidth <= 0) {
+    if (!container || container.clientWidth <= 0 || container.clientHeight <= 0) {
         state.fitNeedsRecompute = true;
         return;
     }
     try {
-        const page = await state.pdfDoc.getPage(1);
+        const pageNum = Math.max(1, Math.min(state.currentPage || 1, state.totalPages || state.currentPage || 1));
+        const page = await state.pdfDoc.getPage(pageNum);
         const viewport = page.getViewport({ scale: 1.0 });
-        const w = container.clientWidth - 60;
-        if (w > 0 && viewport.width > 0) {
-            state.scale = w / viewport.width;
+        const fitType = getFitType(state);
+        let targetSize = 0;
+        let sourceSize = 0;
+
+        if (fitType === 'height') {
+            targetSize = container.clientHeight - 8;
+            sourceSize = viewport.height;
+        } else {
+            // autoWidth preserves the app's historical default open behavior.
+            targetSize = container.clientWidth - (fitType === 'autoWidth' ? 60 : 8);
+            if (state.spreadMode && state.currentPage !== 1 && fitType === 'width') {
+                targetSize = (targetSize - 4) / 2;
+            }
+            sourceSize = viewport.width;
+        }
+
+        if (targetSize > 0 && sourceSize > 0) {
+            state.scale = targetSize / sourceSize;
             state.fitNeedsRecompute = false;
         } else {
             state.fitNeedsRecompute = true;
@@ -675,12 +877,14 @@ async function loadPdfForTab(tabId, book) {
         totalPages: 0,
         scale: restoredZoom || 1.0,
         fitMode: !restoredZoom, // if no saved zoom, use fit-to-width default
+        fitType: restoredZoom ? 'none' : 'autoWidth',
         fitNeedsRecompute: !restoredZoom,
         thumbnailsOpen: false,
         loaded: false,
         loading: true,
         bookId: book.id,
         spreadMode: !!book.lastSpreadMode,
+        spreadDirection: book.lastSpreadDirection === 0 ? 'ltr' : 'rtl',
         scrollDir: 'vertical',
         comments: [],
         bookmarks: [],
@@ -795,8 +999,7 @@ async function renderPdfPages(tabId, preserveScroll = false) {
     document.getElementById('page-input').value = state.currentPage;
     document.getElementById('page-total').textContent = state.totalPages;
     document.getElementById('zoom-level').textContent = Math.round(state.scale * 100) + '%';
-    document.getElementById('btn-prev').disabled = state.currentPage <= 1;
-    document.getElementById('btn-next').disabled = state.currentPage >= state.totalPages;
+    updatePageNavigationState(state);
 
     if (preserveScroll && pagesContainer.scrollWidth > 0 && pagesContainer.scrollHeight > 0) {
         // Restore scroll position based on ratio
@@ -822,24 +1025,24 @@ async function renderSinglePage(tabId, container, state) {
 }
 
 async function renderSpreadView(tabId, container, state) {
-    // Page 1 alone (cover), then 2-3, 4-5, etc.
-    let startPage = state.currentPage;
-    // Align to spread: cover=1, then even-odd pairs
+    // Page 1 alone (cover), then 2-3, 4-5, etc. Visual order follows binding direction.
+    const startPage = getSpreadAnchorPage(state);
     if (startPage === 1) {
         const w = await createRenderedPage(state, 1, tabId);
         if (w) container.appendChild(w);
     } else {
-        // Ensure even start for left page
-        if (startPage % 2 === 1) startPage--;
-        if (startPage < 2) startPage = 2;
-
         const pair = document.createElement('div');
         pair.className = 'spread-pair';
-        const left = await createRenderedPage(state, startPage, tabId);
-        if (left) pair.appendChild(left);
+        const pageNums = [startPage];
         if (startPage + 1 <= state.totalPages) {
-            const right = await createRenderedPage(state, startPage + 1, tabId);
-            if (right) pair.appendChild(right);
+            pageNums.push(startPage + 1);
+        }
+        if (isRightBoundSpread(state)) {
+            pageNums.reverse();
+        }
+        for (const pageNum of pageNums) {
+            const wrapper = await createRenderedPage(state, pageNum, tabId);
+            if (wrapper) pair.appendChild(wrapper);
         }
         container.appendChild(pair);
     }
@@ -969,20 +1172,15 @@ function viewerNav(delta) {
     const state = pdfStates[activeTabId];
     if (!state) return;
 
-    if (state.spreadMode) {
-        // In spread: page 1 alone, then pairs
-        let cur = state.currentPage;
-        if (delta > 0) {
-            cur = cur === 1 ? 2 : cur + 2;
-        } else {
-            cur = cur <= 2 ? 1 : cur - 2;
-        }
-        state.currentPage = Math.max(1, Math.min(cur, state.totalPages));
-    } else {
-        state.currentPage = Math.max(1, Math.min(state.currentPage + delta, state.totalPages));
-    }
+    state.currentPage = getNavigationTargetPage(state, delta);
     renderPdfPages(activeTabId, true);
     saveBookState(activeTabId);
+}
+
+function viewerNavBySide(side) {
+    const state = pdfStates[activeTabId];
+    if (!state) return;
+    viewerNav(getVisualNavigationDelta(state, side));
 }
 
 function viewerSetZoom(newScale) {
@@ -990,7 +1188,10 @@ function viewerSetZoom(newScale) {
     if (!state) return;
     state.scale = Math.max(0.3, Math.min(newScale, 5.0));
     state.fitMode = false;
+    state.fitType = 'none';
+    state.fitNeedsRecompute = false;
     updateViewerZoomSlider(state);
+    updateFitButtonState(state);
     renderPdfPages(activeTabId);
     scheduleSaveBookState(activeTabId);
 }
@@ -1004,47 +1205,33 @@ function updateViewerZoomSlider(state) {
     document.getElementById('viewer-zoom-slider').value = pct;
 }
 
-// fitState cycles: 'none' -> 'height' -> 'width' -> 'none'
-let fitState = 'none';
-
 async function viewerFitCycle() {
     const state = pdfStates[activeTabId];
     if (!state || !state.pdfDoc) return;
-    const page = await state.pdfDoc.getPage(state.currentPage);
-    const vp = page.getViewport({ scale: 1.0 });
-    const container = document.getElementById('viewer-container');
-    const padding = 8; // 4px each side
-    const availW = container.clientWidth - padding;
-    const availH = container.clientHeight - padding;
-    const fitBtn = document.getElementById('btn-fit');
 
-    if (fitState === 'none') {
-        // Fit height
-        let h = availH;
-        if (state.spreadMode && state.currentPage === 1) h = availH;
-        state.scale = h / vp.height;
-        fitState = 'height';
+    const fitType = getFitType(state);
+    if (fitType === 'none' || fitType === 'autoWidth') {
+        state.fitType = 'height';
         state.fitMode = true;
-        fitBtn.title = '縦に合わせ中 (もう1回で横に合わせる)';
-        fitBtn.classList.add('active');
-    } else if (fitState === 'height') {
-        // Fit width
-        let w = availW;
-        if (state.spreadMode && state.currentPage !== 1) w = (availW - 4) / 2;
-        state.scale = w / vp.width;
-        fitState = 'width';
+        state.fitNeedsRecompute = true;
+    } else if (fitType === 'height') {
+        state.fitType = 'width';
         state.fitMode = true;
-        fitBtn.title = '横に合わせ中 (もう1回で解除)';
+        state.fitNeedsRecompute = true;
     } else {
-        // Back to manual
-        fitState = 'none';
+        state.fitType = 'none';
         state.fitMode = false;
-        fitBtn.title = '縦に合わせる';
-        fitBtn.classList.remove('active');
+        state.fitNeedsRecompute = false;
+        updateFitButtonState(state);
+        scheduleSaveBookState(activeTabId);
         return; // Don't re-render, just release fit mode
     }
+
+    await ensureFitScale(state);
     updateViewerZoomSlider(state);
+    updateFitButtonState(state);
     renderPdfPages(activeTabId);
+    scheduleSaveBookState(activeTabId);
 }
 
 function toggleSpreadMode() {
@@ -1052,16 +1239,34 @@ function toggleSpreadMode() {
     if (!state) return;
     state.spreadMode = !state.spreadMode;
     document.getElementById('btn-spread').classList.toggle('active', state.spreadMode);
+    updateSpreadDirectionButtonState(state);
+    updatePageNavigationState(state);
     if (state.fitMode) {
-        // Re-apply the current fit mode with spread considered
-        const prevFit = fitState;
-        fitState = 'none'; // reset so cycle re-enters
-        if (prevFit === 'height' || prevFit === 'width') {
-            fitState = prevFit === 'height' ? 'none' : 'height';
-            viewerFitCycle();
-        } else { renderPdfPages(activeTabId); }
+        const tabId = activeTabId;
+        state.fitNeedsRecompute = true;
+        ensureFitScale(state).then(() => {
+            if (activeTabId !== tabId || pdfStates[tabId] !== state) return;
+            updateViewerZoomSlider(state);
+            updateFitButtonState(state);
+            renderPdfPages(tabId);
+            saveBookState(tabId);
+        });
     }
-    else renderPdfPages(activeTabId);
+    else {
+        renderPdfPages(activeTabId);
+        saveBookState(activeTabId);
+    }
+}
+
+function toggleSpreadDirection() {
+    const state = pdfStates[activeTabId];
+    if (!state) return;
+    state.spreadDirection = isRightBoundSpread(state) ? 'ltr' : 'rtl';
+    updateSpreadDirectionButtonState(state);
+    updatePageNavigationState(state);
+    if (state.spreadMode) {
+        renderPdfPages(activeTabId, true);
+    }
     saveBookState(activeTabId);
 }
 
@@ -1173,7 +1378,10 @@ async function renderBooks() {
         books = sortBooks(books, currentSort);
     }
 
-    countEl.textContent = books.length > 0 ? `${books.length}冊` : '';
+    const folderModel = shouldUseBookFolderGrid(query) ? buildBookFolderModel(books) : null;
+    countEl.textContent = books.length > 0
+        ? `${books.length}冊${folderModel?.folderCount ? ` / ${folderModel.folderCount}フォルダ` : ''}`
+        : '';
 
     if (books.length === 0) {
         grid.style.display = 'none';
@@ -1183,16 +1391,64 @@ async function renderBooks() {
 
     emptyState.style.display = 'none';
 
-    if (viewMode === 'stacks' && allTags.length > 0) {
-        grid.style.display = 'grid';
-        await renderStacksView(grid, books);
-    } else if (viewMode === 'list') {
+    if (viewMode === 'list') {
         grid.style.display = 'block';
         await renderListView(grid, books);
     } else {
         grid.style.display = 'grid';
-        await renderGridView(grid, books);
+        await renderGridView(grid, books, folderModel);
     }
+}
+
+function shouldUseBookFolderGrid(query) {
+    return viewMode === 'grid' && currentFilter === 'all' && !query;
+}
+
+function buildBookFolderModel(books) {
+    sanitizeManualBookStacks();
+    const manualFolders = getManualBookFolders(books);
+    const manualFolderByBookId = new Map();
+    for (const folder of manualFolders) {
+        for (const book of folder.books) manualFolderByBookId.set(book.id, folder);
+    }
+
+    if (manualFolders.length === 0) return null;
+
+    const items = [];
+    const renderedFolderIds = new Set();
+
+    for (const book of books) {
+        const manualFolder = manualFolderByBookId.get(book.id);
+        if (manualFolder) {
+            if (!renderedFolderIds.has(manualFolder.id)) {
+                renderedFolderIds.add(manualFolder.id);
+                items.push({ type: 'folder', folder: manualFolder });
+            }
+            continue;
+        }
+
+        items.push({ type: 'book', book });
+    }
+
+    return { items, folderCount: renderedFolderIds.size };
+}
+
+function getManualBookFolders(visibleBooks = allBooks) {
+    const visibleById = new Map(visibleBooks.map(book => [book.id, book]));
+    return manualBookStacks
+        .map(stack => {
+            const books = stack.bookIds.map(bookId => visibleById.get(bookId)).filter(Boolean);
+            if (books.length < 2) return null;
+            return {
+                id: stack.id,
+                type: 'manual',
+                name: stack.name,
+                color: stack.color,
+                stack,
+                books,
+            };
+        })
+        .filter(Boolean);
 }
 
 function sortBooks(books, sortBy) {
@@ -1223,122 +1479,16 @@ function sortBooks(books, sortBy) {
     });
 }
 
-function renderGridView(grid, books) {
+function renderGridView(grid, books, folderModel = null) {
     const fragment = document.createDocumentFragment();
+    const items = folderModel?.items || books.map(book => ({ type: 'book', book }));
 
-    for (const book of books) {
-        fragment.appendChild(createBookCard(book));
+    for (const item of items) {
+        if (item.type === 'folder') fragment.appendChild(createBookFolderCard(item.folder));
+        else fragment.appendChild(createBookCard(item.book));
     }
     grid.innerHTML = '';
     grid.appendChild(fragment);
-}
-
-function renderStacksView(grid, books) {
-    grid.innerHTML = '';
-
-    // Group books by tags
-    const taggedGroups = {};
-    const untagged = [];
-
-    for (const book of books) {
-        if (book.tags.length === 0) { untagged.push(book); continue; }
-        const mainTag = book.tags[0];
-        if (!taggedGroups[mainTag.id]) taggedGroups[mainTag.id] = { tag: mainTag, books: [] };
-        taggedGroups[mainTag.id].books.push(book);
-    }
-
-    // Render each tag group as a stack
-    for (const group of Object.values(taggedGroups)) {
-        const stackEl = document.createElement('div');
-        stackEl.className = 'stack-group';
-        const isExpanded = stacksExpanded[group.tag.id] !== false; // Default expanded
-
-        const header = document.createElement('div');
-        header.className = 'stack-header' + (isExpanded ? '' : ' collapsed');
-        header.innerHTML = `
-      <svg class="stack-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
-      <span class="stack-dot" style="background:${group.tag.color}"></span>
-      <span class="stack-name">${escapeHtml(group.tag.name)}</span>
-      <span class="stack-count">${group.books.length}冊</span>
-    `;
-        header.addEventListener('click', () => {
-            stacksExpanded[group.tag.id] = !isExpanded;
-            renderBooks();
-        });
-        stackEl.appendChild(header);
-
-        if (isExpanded) {
-            const cards = document.createElement('div');
-            cards.className = 'stack-cards';
-            cards.style.display = 'grid';
-            cards.style.gridTemplateColumns = `repeat(auto-fill, minmax(${bookshelfCardSize}px, 1fr))`;
-            cards.style.gap = '20px';
-            for (const book of group.books) {
-                cards.appendChild(createBookCard(book));
-            }
-            stackEl.appendChild(cards);
-        } else {
-            // Collapsed: show fanned preview
-            const preview = document.createElement('div');
-            preview.className = 'stack-collapsed-preview';
-            const previewBooks = group.books.slice(0, 3);
-            for (const book of previewBooks) {
-                const cover = document.createElement('div');
-                cover.className = 'stacked-cover';
-                if (book.coverPath) {
-                    const img = document.createElement('img');
-                    cover.appendChild(img);
-                    invoke('get_cover_data', { coverPath: book.coverPath }).then(dataUrl => {
-                        if (dataUrl) img.src = dataUrl;
-                    });
-                }
-                preview.appendChild(cover);
-            }
-            const info = document.createElement('div');
-            info.className = 'stack-collapsed-info';
-            info.innerHTML = `<div class="stack-name">${escapeHtml(group.tag.name)}</div><div class="stack-count">${group.books.length}冊</div>`;
-            preview.appendChild(info);
-            preview.addEventListener('click', () => {
-                stacksExpanded[group.tag.id] = true;
-                renderBooks();
-            });
-            stackEl.appendChild(preview);
-        }
-
-        grid.appendChild(stackEl);
-    }
-
-    // Untagged books
-    if (untagged.length > 0) {
-        const stackEl = document.createElement('div');
-        stackEl.className = 'stack-group';
-        const isExpanded = stacksExpanded['untagged'] !== false;
-        const header = document.createElement('div');
-        header.className = 'stack-header' + (isExpanded ? '' : ' collapsed');
-        header.innerHTML = `
-      <svg class="stack-chevron" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
-      <span class="stack-dot" style="background:#8e8e93"></span>
-      <span class="stack-name">タグなし</span>
-      <span class="stack-count">${untagged.length}冊</span>
-    `;
-        header.addEventListener('click', () => {
-            stacksExpanded['untagged'] = !isExpanded;
-            renderBooks();
-        });
-        stackEl.appendChild(header);
-
-        if (isExpanded) {
-            const cards = document.createElement('div');
-            cards.className = 'stack-cards';
-            cards.style.display = 'grid';
-            cards.style.gridTemplateColumns = `repeat(auto-fill, minmax(${bookshelfCardSize}px, 1fr))`;
-            cards.style.gap = '20px';
-            for (const book of untagged) cards.appendChild(createBookCard(book));
-            stackEl.appendChild(cards);
-        }
-
-        grid.appendChild(stackEl);
-    }
 }
 
 function sortIndicator(col) {
@@ -1428,7 +1578,583 @@ async function toggleFavorite(bookId) {
     const newVal = book.favorite ? 0 : 1;
     await invoke('update_book', { id: bookId, updates: { favorite: newVal } });
     book.favorite = newVal;
-    renderBooks();
+    await renderBooks();
+    if (activeBookFolderRef) {
+        const folder = getBookFolderByRef(activeBookFolderRef);
+        if (folder) openBookFolder(folder);
+        else closeBookFolder();
+    }
+}
+
+function createBookFolderCard(folder) {
+    const card = document.createElement('div');
+    card.className = 'book-folder-card';
+    card.setAttribute('role', 'button');
+    card.tabIndex = 0;
+    card.dataset.folderId = folder.id;
+    card.dataset.folderType = folder.type;
+    card.dataset.folderRefId = folder.type === 'tag' ? String(folder.tag.id) : folder.id;
+
+    const preview = document.createElement('div');
+    preview.className = 'book-folder-preview';
+    preview.style.setProperty('--folder-accent', getBookFolderColor(folder));
+
+    const coverGrid = document.createElement('div');
+    coverGrid.className = 'book-folder-cover-grid';
+    for (const book of folder.books.slice(0, BOOK_FOLDER_PREVIEW_LIMIT)) {
+        coverGrid.appendChild(createFolderPreviewTile(book));
+    }
+    preview.appendChild(coverGrid);
+
+    const info = document.createElement('div');
+    info.className = 'book-info book-folder-info';
+    info.innerHTML = `
+      <div class="book-title">${escapeHtml(getBookFolderName(folder))}</div>
+      <div class="book-folder-meta">${folder.books.length}冊</div>
+    `;
+
+    card.appendChild(preview);
+    card.appendChild(info);
+
+    const open = () => openBookFolder(folder);
+    card.addEventListener('click', open);
+    if (folder.type === 'manual') {
+        card.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            openStackRenameModal(folder.id);
+        });
+    }
+    card.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            open();
+        }
+    });
+    attachFolderDragHandlers(card, folder);
+
+    loadFolderPreviewCovers(card);
+    return card;
+}
+
+function getBookFolderName(folder) {
+    return folder.name || folder.tag?.name || 'スタック';
+}
+
+function getBookFolderColor(folder) {
+    return folder.color || folder.tag?.color || '#8e8e93';
+}
+
+function createFolderPreviewTile(book) {
+    const tile = document.createElement('div');
+    tile.className = 'book-folder-cover-tile';
+    if (book.coverPath) {
+        const img = document.createElement('img');
+        img.dataset.coverPath = book.coverPath;
+        img.alt = '';
+        img.loading = 'lazy';
+        img.draggable = false;
+        tile.appendChild(img);
+    } else {
+        tile.classList.add('placeholder');
+        tile.textContent = getBookInitial(book.title);
+    }
+    return tile;
+}
+
+function getBookInitial(title) {
+    const normalized = String(title || '').trim();
+    return normalized ? normalized[0].toUpperCase() : '本';
+}
+
+function loadFolderPreviewCovers(root) {
+    root.querySelectorAll('img[data-cover-path]').forEach(img => {
+        img.draggable = false;
+        invoke('get_cover_data', { coverPath: img.dataset.coverPath }).then(dataUrl => {
+            if (dataUrl) img.src = dataUrl;
+        });
+    });
+}
+
+function getBookFolderByRef(ref) {
+    if (!ref) return null;
+    if (ref.type === 'manual') {
+        const stack = manualBookStacks.find(s => s.id === ref.id);
+        if (!stack) return null;
+        const booksById = new Map(allBooks.map(book => [book.id, book]));
+        const books = stack.bookIds.map(bookId => booksById.get(bookId)).filter(Boolean);
+        if (books.length < 2) return null;
+        return {
+            id: stack.id,
+            type: 'manual',
+            name: stack.name,
+            color: stack.color,
+            stack,
+            books: sortBooks([...books], currentSort),
+        };
+    }
+
+    if (ref.type === 'tag') {
+        const normalizedTagId = parseInt(String(ref.id).replace(/^tag-/, ''));
+        const tag = allTags.find(t => t.id === normalizedTagId);
+        if (!tag) return null;
+        const books = allBooks.filter(book => {
+            const mainTag = book.tags && book.tags.length > 0 ? book.tags[0] : null;
+            return mainTag && mainTag.id === normalizedTagId;
+        });
+        if (books.length === 0) return null;
+        return {
+            id: `tag-${tag.id}`,
+            type: 'tag',
+            name: tag.name,
+            color: tag.color,
+            tag,
+            books: sortBooks([...books], currentSort),
+        };
+    }
+    return null;
+}
+
+function openBookFolder(folder) {
+    activeBookFolderRef = {
+        type: folder.type,
+        id: folder.type === 'tag' ? folder.tag.id : folder.id,
+    };
+    let overlay = document.getElementById('book-folder-overlay');
+    if (!overlay) {
+        overlay = document.createElement('div');
+        overlay.id = 'book-folder-overlay';
+        overlay.className = 'book-folder-overlay';
+        document.body.appendChild(overlay);
+    }
+
+    const renameButtonHtml = folder.type === 'manual' ? `
+          <button class="book-folder-action book-folder-rename" type="button" title="名前を変更" aria-label="名前を変更">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 20h9" />
+              <path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4 12.5-12.5z" />
+            </svg>
+          </button>
+    ` : '';
+
+    overlay.innerHTML = `
+      <div class="book-folder-panel" role="dialog" aria-modal="true" aria-labelledby="book-folder-title">
+        <div class="book-folder-header">
+          <div class="book-folder-heading">
+            <span class="book-folder-dot" style="background:${getBookFolderColor(folder)}"></span>
+            <div>
+              <h3 id="book-folder-title">${escapeHtml(getBookFolderName(folder))}</h3>
+              <span>${folder.books.length}冊</span>
+            </div>
+          </div>
+          <div class="book-folder-actions">
+            ${renameButtonHtml}
+            <button class="book-folder-action book-folder-close" type="button" title="閉じる" aria-label="閉じる">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                <line x1="18" y1="6" x2="6" y2="18" />
+                <line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
+            </button>
+          </div>
+        </div>
+        <div class="book-folder-books"></div>
+      </div>
+    `;
+
+    const booksGrid = overlay.querySelector('.book-folder-books');
+    const folderCardSize = Math.max(110, Math.min(bookshelfCardSize, 180));
+    booksGrid.style.gridTemplateColumns = `repeat(auto-fill, minmax(${folderCardSize}px, 1fr))`;
+    for (const book of folder.books) {
+        const bookCard = createBookCard(book);
+        if (folder.type === 'manual') {
+            bookCard.dataset.stackId = folder.id;
+            bookCard.dataset.stackOverlay = 'true';
+        }
+        bookCard.addEventListener('click', closeBookFolder);
+        booksGrid.appendChild(bookCard);
+    }
+
+    overlay.querySelector('.book-folder-rename')?.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openStackRenameModal(folder.id);
+    });
+    overlay.querySelector('.book-folder-close').addEventListener('click', closeBookFolder);
+    overlay.onclick = (e) => {
+        if (e.target === overlay) closeBookFolder();
+    };
+
+    overlay.style.display = 'flex';
+    requestAnimationFrame(() => overlay.classList.add('active'));
+}
+
+function closeBookFolder() {
+    const overlay = document.getElementById('book-folder-overlay');
+    if (!overlay) return;
+    overlay.classList.remove('active');
+    overlay.style.display = 'none';
+    activeBookFolderRef = null;
+}
+
+function attachBookDragHandlers(card, book) {
+    card.draggable = false;
+    card.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0 || e.target.closest('.fav-btn-card')) return;
+        startPointerBookDrag(e, card, book);
+        const onMove = (moveEvent) => {
+            if (!pointerBookDrag || pointerBookDrag.bookId !== book.id) return;
+            const dx = moveEvent.clientX - pointerBookDrag.startX;
+            const dy = moveEvent.clientY - pointerBookDrag.startY;
+            if (!pointerBookDrag.dragging && Math.hypot(dx, dy) >= BOOK_STACK_DRAG_THRESHOLD) {
+                beginPointerBookDrag(moveEvent);
+            }
+            updatePointerBookDrag(moveEvent);
+            if (pointerBookDrag?.dragging) moveEvent.preventDefault();
+        };
+        const onUp = (upEvent) => {
+            document.removeEventListener('pointermove', onMove, true);
+            document.removeEventListener('pointerup', onUp, true);
+            document.removeEventListener('pointercancel', onCancel, true);
+            finishPointerBookDrag(upEvent);
+        };
+        const onCancel = () => {
+            document.removeEventListener('pointermove', onMove, true);
+            document.removeEventListener('pointerup', onUp, true);
+            document.removeEventListener('pointercancel', onCancel, true);
+            pointerBookDrag = null;
+            cleanupPointerBookDrag();
+        };
+        document.addEventListener('pointermove', onMove, true);
+        document.addEventListener('pointerup', onUp, true);
+        document.addEventListener('pointercancel', onCancel, true);
+    });
+    card.addEventListener('dragstart', (e) => {
+        if (!card.draggable) {
+            e.preventDefault();
+            return;
+        }
+        draggedBookId = book.id;
+        card.classList.add('dragging');
+        document.getElementById('drop-overlay')?.classList.remove('active');
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('application/x-paperstock-book-id', String(book.id));
+        e.dataTransfer.setData('text/plain', String(book.id));
+    });
+    card.addEventListener('dragend', () => {
+        draggedBookId = null;
+        suppressBookClickUntil = Date.now() + 250;
+        document.querySelectorAll('.drop-target, .dragging').forEach(el => {
+            el.classList.remove('drop-target', 'dragging');
+        });
+    });
+    card.addEventListener('dragover', (e) => {
+        if (!draggedBookId || draggedBookId === book.id) return;
+        e.preventDefault();
+        e.stopPropagation();
+        e.dataTransfer.dropEffect = 'move';
+        card.classList.add('drop-target');
+    });
+    card.addEventListener('dragleave', () => {
+        card.classList.remove('drop-target');
+    });
+    card.addEventListener('drop', async (e) => {
+        if (!draggedBookId || draggedBookId === book.id) return;
+        e.preventDefault();
+        e.stopPropagation();
+        card.classList.remove('drop-target');
+        await stackBookOntoBook(draggedBookId, book.id);
+    });
+}
+
+function attachFolderDragHandlers(card, folder) {
+    card.addEventListener('dragover', (e) => {
+        if (!draggedBookId || folder.books.some(book => book.id === draggedBookId)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        e.dataTransfer.dropEffect = 'move';
+        card.classList.add('drop-target');
+    });
+    card.addEventListener('dragleave', () => {
+        card.classList.remove('drop-target');
+    });
+    card.addEventListener('drop', async (e) => {
+        if (!draggedBookId || folder.books.some(book => book.id === draggedBookId)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        card.classList.remove('drop-target');
+        await stackBookIntoFolder(draggedBookId, folder);
+    });
+}
+
+async function stackBookOntoBook(sourceBookId, targetBookId) {
+    const sourceId = parseInt(sourceBookId);
+    const targetId = parseInt(targetBookId);
+    if (!Number.isFinite(sourceId) || !Number.isFinite(targetId) || sourceId === targetId) return;
+
+    const targetStack = getManualStackContainingBook(targetId);
+    if (targetStack) {
+        moveBookToManualStack(sourceId, targetStack);
+    } else {
+        const sourceStack = getManualStackContainingBook(sourceId);
+        if (sourceStack && sourceStack.bookIds.includes(targetId)) return;
+        const targetBook = allBooks.find(book => book.id === targetId);
+        createManualBookStack([targetId, sourceId], getSuggestedStackName(targetBook), getSuggestedStackColor(targetBook));
+    }
+    await refreshAfterManualStackChange();
+}
+
+async function stackBookIntoFolder(sourceBookId, folder) {
+    const sourceId = parseInt(sourceBookId);
+    if (!Number.isFinite(sourceId) || folder.books.some(book => book.id === sourceId)) return;
+
+    if (folder.type === 'manual') {
+        const stack = manualBookStacks.find(s => s.id === folder.id);
+        if (stack) moveBookToManualStack(sourceId, stack);
+    } else {
+        createManualBookStack(
+            [...folder.books.map(book => book.id), sourceId],
+            getBookFolderName(folder),
+            getBookFolderColor(folder)
+        );
+    }
+    await refreshAfterManualStackChange();
+}
+
+function getManualStackContainingBook(bookId) {
+    return manualBookStacks.find(stack => stack.bookIds.includes(parseInt(bookId))) || null;
+}
+
+function createManualBookStack(bookIds, name = 'スタック', color = '#8e8e93') {
+    const uniqueBookIds = [...new Set(bookIds.map(id => parseInt(id)).filter(Number.isFinite))];
+    if (uniqueBookIds.length < 2) return null;
+    for (const bookId of uniqueBookIds) removeBookFromManualStacks(bookId, false);
+    const stack = {
+        id: `manual-${nextManualStackId++}`,
+        name,
+        color,
+        bookIds: uniqueBookIds,
+        createdAt: new Date().toISOString(),
+    };
+    manualBookStacks.push(stack);
+    cleanupManualBookStacks();
+    return stack;
+}
+
+function moveBookToManualStack(bookId, targetStack) {
+    const normalizedBookId = parseInt(bookId);
+    if (!Number.isFinite(normalizedBookId)) return;
+    removeBookFromManualStacks(normalizedBookId, false);
+    if (!targetStack.bookIds.includes(normalizedBookId)) targetStack.bookIds.push(normalizedBookId);
+    cleanupManualBookStacks();
+}
+
+function removeBookFromManualStacks(bookId, shouldCleanup = true) {
+    const normalizedBookId = parseInt(bookId);
+    for (const stack of manualBookStacks) {
+        stack.bookIds = stack.bookIds.filter(id => id !== normalizedBookId);
+    }
+    if (shouldCleanup) cleanupManualBookStacks();
+}
+
+function cleanupManualBookStacks() {
+    manualBookStacks = manualBookStacks.filter(stack => stack.bookIds.length >= 2);
+    persistManualBookStacks();
+}
+
+async function refreshAfterManualStackChange() {
+    sanitizeManualBookStacks();
+    persistManualBookStacks();
+    await renderBooks();
+    if (activeBookFolderRef) {
+        const folder = getBookFolderByRef(activeBookFolderRef);
+        if (folder) openBookFolder(folder);
+        else closeBookFolder();
+    }
+}
+
+function getSuggestedStackName() {
+    return 'スタック';
+}
+
+function getSuggestedStackColor() {
+    return '#8e8e93';
+}
+
+function isExternalFileDrag(e) {
+    const types = Array.from(e.dataTransfer?.types || []);
+    return types.includes('Files');
+}
+
+function getPdfPathsFromDragPayload(payload) {
+    const paths = Array.isArray(payload?.paths) ? payload.paths : [];
+    return paths.filter(p => String(p).toLowerCase().endsWith('.pdf'));
+}
+
+function getDraggedBookIdFromEvent(e) {
+    if (draggedBookId) return draggedBookId;
+    let raw = '';
+    try {
+        raw = e.dataTransfer?.getData('application/x-paperstock-book-id')
+            || e.dataTransfer?.getData('text/plain')
+            || '';
+    } catch (_e) { return null; }
+    const parsed = parseInt(raw);
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+function getInternalBookDropTarget(e) {
+    const hitElement = (Number.isFinite(e.clientX) && Number.isFinite(e.clientY))
+        ? document.elementFromPoint(e.clientX, e.clientY)
+        : e.target;
+    const closest = hitElement?.closest?.('.book-card, .book-folder-card');
+    if (!closest) return null;
+
+    if (closest.classList.contains('book-folder-card')) {
+        return {
+            kind: 'folder',
+            element: closest,
+            folderType: closest.dataset.folderType,
+            folderId: closest.dataset.folderRefId || closest.dataset.folderId,
+        };
+    }
+
+    if (closest.classList.contains('book-card')) {
+        const bookId = parseInt(closest.dataset.id);
+        const sourceBookId = getDraggedBookIdFromEvent(e);
+        if (!Number.isFinite(bookId) || bookId === sourceBookId) return null;
+        return { kind: 'book', element: closest, bookId };
+    }
+
+    return null;
+}
+
+function getInternalBookDropTargetAt(clientX, clientY) {
+    const hitElement = document.elementFromPoint(clientX, clientY);
+    return getInternalBookDropTarget({
+        target: hitElement,
+        clientX,
+        clientY,
+        dataTransfer: { getData: () => String(draggedBookId || '') },
+    });
+}
+
+function updateInternalDropTarget(e) {
+    document.querySelectorAll('.drop-target').forEach(el => el.classList.remove('drop-target'));
+    if (!draggedBookId) return;
+    const target = getInternalBookDropTarget(e);
+    if (target?.element) target.element.classList.add('drop-target');
+}
+
+async function handleInternalBookDrop(e) {
+    const sourceBookId = getDraggedBookIdFromEvent(e);
+    if (!sourceBookId) return false;
+
+    const target = getInternalBookDropTarget(e);
+    e.preventDefault();
+    e.stopPropagation();
+
+    document.getElementById('drop-overlay')?.classList.remove('active');
+    document.querySelectorAll('.drop-target, .dragging').forEach(el => {
+        el.classList.remove('drop-target', 'dragging');
+    });
+    suppressBookClickUntil = Date.now() + 350;
+
+    if (!target) return true;
+
+    if (target.kind === 'book') {
+        await stackBookOntoBook(sourceBookId, target.bookId);
+    } else if (target.kind === 'folder') {
+        const folder = getBookFolderByRef({ type: target.folderType, id: target.folderId });
+        if (folder) await stackBookIntoFolder(sourceBookId, folder);
+    }
+
+    return true;
+}
+
+function startPointerBookDrag(e, card, book) {
+    pointerBookDrag = {
+        bookId: book.id,
+        sourceEl: card,
+        sourceStackId: card.dataset.stackId || null,
+        sourceInStackOverlay: card.dataset.stackOverlay === 'true',
+        startX: e.clientX,
+        startY: e.clientY,
+        dragging: false,
+        ghost: null,
+    };
+}
+
+function beginPointerBookDrag(e) {
+    if (!pointerBookDrag || pointerBookDrag.dragging) return;
+    pointerBookDrag.dragging = true;
+    draggedBookId = pointerBookDrag.bookId;
+    suppressBookClickUntil = Date.now() + 500;
+    document.getElementById('drop-overlay')?.classList.remove('active');
+    pointerBookDrag.sourceEl.classList.add('dragging');
+
+    const ghost = pointerBookDrag.sourceEl.cloneNode(true);
+    ghost.className = 'book-drag-ghost';
+    ghost.style.width = `${pointerBookDrag.sourceEl.offsetWidth}px`;
+    ghost.style.height = `${pointerBookDrag.sourceEl.offsetHeight}px`;
+    document.body.appendChild(ghost);
+    pointerBookDrag.ghost = ghost;
+    updatePointerBookDrag(e);
+}
+
+function updatePointerBookDrag(e) {
+    if (!pointerBookDrag?.dragging) return;
+    if (pointerBookDrag.ghost) {
+        pointerBookDrag.ghost.style.transform = `translate(${e.clientX + 14}px, ${e.clientY + 14}px)`;
+    }
+    document.querySelectorAll('.drop-target').forEach(el => el.classList.remove('drop-target'));
+    const target = getInternalBookDropTargetAt(e.clientX, e.clientY);
+    if (target?.element) target.element.classList.add('drop-target');
+}
+
+async function finishPointerBookDrag(e) {
+    if (!pointerBookDrag) return;
+    const state = pointerBookDrag;
+    pointerBookDrag = null;
+
+    if (!state.dragging) return;
+
+    const sourceBookId = state.bookId;
+    const target = getInternalBookDropTargetAt(e.clientX, e.clientY);
+    const shouldRemoveFromStack = isOutsideSourceStackPanelDrop(state, e.clientX, e.clientY);
+    cleanupPointerBookDrag();
+    suppressBookClickUntil = Date.now() + 500;
+
+    if (shouldRemoveFromStack) {
+        removeBookFromManualStacks(sourceBookId);
+        await refreshAfterManualStackChange();
+        return;
+    }
+
+    if (!target) return;
+    if (target.kind === 'book') {
+        await stackBookOntoBook(sourceBookId, target.bookId);
+    } else if (target.kind === 'folder') {
+        const folder = getBookFolderByRef({ type: target.folderType, id: target.folderId });
+        if (folder) await stackBookIntoFolder(sourceBookId, folder);
+    }
+}
+
+function isOutsideSourceStackPanelDrop(state, clientX, clientY) {
+    if (!state?.sourceStackId || !state.sourceInStackOverlay) return false;
+    const overlay = document.getElementById('book-folder-overlay');
+    const panel = overlay?.querySelector('.book-folder-panel');
+    if (!overlay || !panel || overlay.style.display === 'none') return false;
+    const rect = panel.getBoundingClientRect();
+    return clientX < rect.left || clientX > rect.right || clientY < rect.top || clientY > rect.bottom;
+}
+
+function cleanupPointerBookDrag() {
+    draggedBookId = null;
+    document.getElementById('drop-overlay')?.classList.remove('active');
+    document.querySelectorAll('.drop-target, .dragging').forEach(el => {
+        el.classList.remove('drop-target', 'dragging');
+    });
+    if (pointerBookDrag?.ghost) pointerBookDrag.ghost.remove();
+    document.querySelectorAll('.book-drag-ghost').forEach(el => el.remove());
 }
 
 function createBookCard(book) {
@@ -1438,7 +2164,7 @@ function createBookCard(book) {
 
     let coverHtml;
     if (book.coverPath) {
-        coverHtml = `<img class="book-cover" data-cover-path="${escapeHtml(book.coverPath)}" alt="${escapeHtml(book.title)}" loading="lazy">`;
+        coverHtml = `<img class="book-cover" data-cover-path="${escapeHtml(book.coverPath)}" alt="${escapeHtml(book.title)}" loading="lazy" draggable="false">`;
     } else {
         coverHtml = placeholderHtml(book.title);
     }
@@ -1470,16 +2196,19 @@ function createBookCard(book) {
         toggleFavorite(book.id);
     });
     card.addEventListener('click', (e) => {
+        if (Date.now() < suppressBookClickUntil) return;
         if (e.target.closest('.fav-btn-card')) return;
         openPdfTab(book.id);
     });
     card.addEventListener('contextmenu', (e) => {
         e.preventDefault(); showContextMenu(e.clientX, e.clientY, book.id);
     });
+    attachBookDragHandlers(card, book);
 
     // Lazy load cover image
     const coverImg = card.querySelector('img[data-cover-path]');
     if (coverImg) {
+        coverImg.draggable = false;
         invoke('get_cover_data', { coverPath: book.coverPath }).then(dataUrl => {
             if (dataUrl) coverImg.src = dataUrl;
         });
@@ -1625,7 +2354,7 @@ function setupEventListeners() {
     });
 
     // View mode toggle
-    const viewBtns = ['btn-view-grid', 'btn-view-list', 'btn-view-stacks'];
+    const viewBtns = ['btn-view-grid', 'btn-view-list'];
     function setViewMode(mode) {
         viewMode = mode;
         viewBtns.forEach(id => document.getElementById(id).classList.remove('active'));
@@ -1634,27 +2363,67 @@ function setupEventListeners() {
     }
     document.getElementById('btn-view-grid').addEventListener('click', () => setViewMode('grid'));
     document.getElementById('btn-view-list').addEventListener('click', () => setViewMode('list'));
-    document.getElementById('btn-view-stacks').addEventListener('click', () => setViewMode('stacks'));
 
     // Drag and drop
     const main = document.getElementById('main-content');
     const dropOverlay = document.getElementById('drop-overlay');
     let dragCounter = 0;
-    main.addEventListener('dragenter', (e) => { e.preventDefault(); dragCounter++; dropOverlay.classList.add('active'); });
-    main.addEventListener('dragleave', (e) => { e.preventDefault(); dragCounter--; if (dragCounter <= 0) { dragCounter = 0; dropOverlay.classList.remove('active'); } });
-    main.addEventListener('dragover', (e) => e.preventDefault());
-    main.addEventListener('drop', (e) => {
-        e.preventDefault(); dragCounter = 0; dropOverlay.classList.remove('active');
+    main.addEventListener('dragenter', (e) => {
+        e.preventDefault();
+        if (draggedBookId || !isExternalFileDrag(e)) {
+            dropOverlay.classList.remove('active');
+            return;
+        }
+        dragCounter++;
+        dropOverlay.classList.add('active');
     });
+    main.addEventListener('dragleave', (e) => {
+        e.preventDefault();
+        if (draggedBookId || !isExternalFileDrag(e)) {
+            dropOverlay.classList.remove('active');
+            return;
+        }
+        dragCounter--;
+        if (dragCounter <= 0) { dragCounter = 0; dropOverlay.classList.remove('active'); }
+    });
+    main.addEventListener('dragover', (e) => {
+        e.preventDefault();
+        if (draggedBookId || !isExternalFileDrag(e)) dropOverlay.classList.remove('active');
+    });
+    main.addEventListener('drop', (e) => {
+        if (draggedBookId || getDraggedBookIdFromEvent(e)) {
+            handleInternalBookDrop(e);
+            return;
+        }
+        e.preventDefault();
+        dragCounter = 0;
+        dropOverlay.classList.remove('active');
+    });
+    document.addEventListener('dragover', (e) => {
+        if (!draggedBookId) return;
+        e.preventDefault();
+        updateInternalDropTarget(e);
+        dropOverlay.classList.remove('active');
+    }, true);
+    document.addEventListener('drop', (e) => {
+        if (!draggedBookId && !getDraggedBookIdFromEvent(e)) return;
+        handleInternalBookDrop(e);
+    }, true);
     // Tauri drag-and-drop API
     getCurrentWebviewWindow().onDragDropEvent(async (event) => {
+        if (draggedBookId) {
+            dragCounter = 0;
+            dropOverlay.classList.remove('active');
+            return;
+        }
+        const pdfPaths = getPdfPathsFromDragPayload(event.payload);
         if (event.payload.type === 'drop') {
             dragCounter = 0;
             dropOverlay.classList.remove('active');
-            const pdfPaths = event.payload.paths.filter(p => p.toLowerCase().endsWith('.pdf'));
             if (pdfPaths.length > 0) await importFiles(pdfPaths);
         } else if (event.payload.type === 'enter' || event.payload.type === 'over') {
-            dropOverlay.classList.add('active');
+            if (pdfPaths.length > 0) dropOverlay.classList.add('active');
+            else dropOverlay.classList.remove('active');
         } else if (event.payload.type === 'leave' || event.payload.type === 'cancelled') {
             dragCounter = 0;
             dropOverlay.classList.remove('active');
@@ -1710,12 +2479,13 @@ function setupEventListeners() {
     });
 
     // ── PDF viewer controls ──
-    document.getElementById('btn-prev').addEventListener('click', () => viewerNav(-1));
-    document.getElementById('btn-next').addEventListener('click', () => viewerNav(1));
+    document.getElementById('btn-prev').addEventListener('click', () => viewerNavBySide('left'));
+    document.getElementById('btn-next').addEventListener('click', () => viewerNavBySide('right'));
     document.getElementById('btn-zoom-in').addEventListener('click', viewerZoomIn);
     document.getElementById('btn-zoom-out').addEventListener('click', viewerZoomOut);
     document.getElementById('btn-fit').addEventListener('click', viewerFitCycle);
     document.getElementById('btn-spread').addEventListener('click', toggleSpreadMode);
+    document.getElementById('btn-spread-direction').addEventListener('click', toggleSpreadDirection);
     document.getElementById('btn-scroll-dir').addEventListener('click', toggleScrollDirection);
     document.getElementById('btn-comment-mode').addEventListener('click', toggleCommentMode);
     document.getElementById('btn-thumbnails').addEventListener('click', viewerToggleThumbnails);
@@ -1727,9 +2497,9 @@ function setupEventListeners() {
         if (!state) return;
         state.scale = parseInt(vzSlider.value) / 100;
         state.fitMode = false;
-        fitState = 'none';
-        document.getElementById('btn-fit').classList.remove('active');
-        document.getElementById('btn-fit').title = '縦に合わせる';
+        state.fitType = 'none';
+        state.fitNeedsRecompute = false;
+        updateFitButtonState(state);
         document.getElementById('zoom-level').textContent = vzSlider.value + '%';
         renderPdfPages(activeTabId);
         scheduleSaveBookState(activeTabId);
@@ -1821,15 +2591,15 @@ function setupEventListeners() {
 
         if (state.scrollDir === 'horizontal') {
             switch (e.key) {
-                case 'ArrowLeft': e.preventDefault(); viewerNav(-1); break;
-                case 'ArrowRight': e.preventDefault(); viewerNav(1); break;
+                case 'ArrowLeft': e.preventDefault(); viewerNavBySide('left'); break;
+                case 'ArrowRight': e.preventDefault(); viewerNavBySide('right'); break;
                 case 'ArrowUp': e.preventDefault(); viewerZoomIn(); break;
                 case 'ArrowDown': e.preventDefault(); viewerZoomOut(); break;
             }
         } else {
             switch (e.key) {
-                case 'ArrowLeft': e.preventDefault(); viewerNav(-1); break;
-                case 'ArrowRight': e.preventDefault(); viewerNav(1); break;
+                case 'ArrowLeft': e.preventDefault(); viewerNavBySide('left'); break;
+                case 'ArrowRight': e.preventDefault(); viewerNavBySide('right'); break;
                 case 'ArrowUp': e.preventDefault(); viewerNav(-1); break;
                 case 'ArrowDown': e.preventDefault(); viewerNav(1); break;
             }
@@ -1838,7 +2608,7 @@ function setupEventListeners() {
         if (e.key === ' ') { e.preventDefault(); viewerNav(e.shiftKey ? -1 : 1); }
         if ((e.metaKey || e.ctrlKey) && e.key === '=') { e.preventDefault(); viewerZoomIn(); }
         if ((e.metaKey || e.ctrlKey) && e.key === '-') { e.preventDefault(); viewerZoomOut(); }
-        if ((e.metaKey || e.ctrlKey) && e.key === '0') { e.preventDefault(); fitState = 'none'; viewerFitCycle(); }
+        if ((e.metaKey || e.ctrlKey) && e.key === '0') { e.preventDefault(); viewerFitCycle(); }
     });
 
     // Resize
@@ -1848,9 +2618,14 @@ function setupEventListeners() {
         resizeTimeout = setTimeout(() => {
             const state = pdfStates[activeTabId];
             if (state && state.fitMode && state.loaded) {
-                const prev = fitState;
-                fitState = prev === 'height' ? 'none' : 'height';
-                viewerFitCycle();
+                const tabId = activeTabId;
+                state.fitNeedsRecompute = true;
+                ensureFitScale(state).then(() => {
+                    if (activeTabId !== tabId || pdfStates[tabId] !== state) return;
+                    updateViewerZoomSlider(state);
+                    updateFitButtonState(state);
+                    renderPdfPages(tabId, true);
+                });
             }
         }, 200);
     });
@@ -2118,23 +2893,63 @@ function openTagAssignModal(bookId) {
 }
 
 let renamingBookId = null;
+let renamingStackId = null;
 function openRenameModal(bookId) {
     renamingBookId = bookId;
+    renamingStackId = null;
     const book = allBooks.find(b => b.id === bookId);
     if (!book) return;
-    document.getElementById('rename-input').value = book.title;
-    document.getElementById('rename-modal').style.display = 'flex';
     const input = document.getElementById('rename-input');
+    document.getElementById('rename-modal-title').textContent = '名前を変更';
+    input.placeholder = '新しいタイトル…';
+    input.value = book.title;
+    document.getElementById('rename-modal').style.display = 'flex';
+    input.focus(); input.select();
+}
+
+function openStackRenameModal(stackId) {
+    const stack = manualBookStacks.find(s => s.id === stackId);
+    if (!stack) return;
+    renamingBookId = null;
+    renamingStackId = stack.id;
+    const input = document.getElementById('rename-input');
+    document.getElementById('rename-modal-title').textContent = 'スタック名を変更';
+    input.placeholder = 'スタック名…';
+    input.value = stack.name || 'スタック';
+    document.getElementById('rename-modal').style.display = 'flex';
     input.focus(); input.select();
 }
 
 async function saveRename() {
-    const title = document.getElementById('rename-input').value.trim();
-    if (!title || !renamingBookId) return;
-    await invoke('update_book', { id: renamingBookId, updates: { title } });
-    closeAllModals(); await loadData(); renderBooks();
-    const tab = tabs.find(t => t.bookId === renamingBookId);
-    if (tab) { tab.title = title; renderTabBar(); }
+    const name = document.getElementById('rename-input').value.trim();
+    if (!name) return;
+
+    if (renamingStackId) {
+        const stackId = renamingStackId;
+        const activeRef = activeBookFolderRef ? { ...activeBookFolderRef } : null;
+        const stack = manualBookStacks.find(s => s.id === stackId);
+        if (!stack) return;
+        stack.name = name;
+        persistManualBookStacks();
+        renamingStackId = null;
+        document.getElementById('rename-modal').style.display = 'none';
+        await renderBooks();
+        if (activeRef?.type === 'manual' && activeRef.id === stackId) {
+            const folder = getBookFolderByRef(activeRef);
+            if (folder) openBookFolder(folder);
+        }
+        return;
+    }
+
+    if (!renamingBookId) return;
+    const bookId = renamingBookId;
+    await invoke('update_book', { id: bookId, updates: { title: name } });
+    closeAllModals();
+    await loadData();
+    await renderBooks();
+    const tab = tabs.find(t => t.bookId === bookId);
+    renamingBookId = null;
+    if (tab) { tab.title = name; renderTabBar(); }
 }
 
 let editingGroupId = null;
@@ -2196,7 +3011,12 @@ function renderColorPalette(elementId, selectedColor, onSelect) {
     });
 }
 
-function closeAllModals() { document.querySelectorAll('.modal-overlay').forEach(m => m.style.display = 'none'); }
+function closeAllModals() {
+    document.querySelectorAll('.modal-overlay').forEach(m => m.style.display = 'none');
+    renamingBookId = null;
+    renamingStackId = null;
+    closeBookFolder();
+}
 
 function escapeHtml(str) {
     const div = document.createElement('div');
