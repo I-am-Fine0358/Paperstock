@@ -1,0 +1,128 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-10-13",
+  "scope": "合成PDFと隔離したデータ領域だけを使用した検証。本人の蔵書・DB・localStorageには触れていない。",
+  "environment": {
+    "platform": "macOS",
+    "osVersion": "26.5.1",
+    "architecture": "arm64",
+    "devicePixelRatio": 2,
+    "engine": "WKWebView with production frontend and PDF.js"
+  },
+  "sources": {
+    "beforeFrontendSHA256": "77d969a2f3d594e089c18cbfbd17b6b43dbf1693845a82f137adc5f06c38a795",
+    "afterFrontendSHA256": "143152c7e42ff175ae339e2312d6d82a1affbfe20a80f0bb16d231208f70158f"
+  },
+  "fixture": {
+    "synthetic": true,
+    "bytes": 10633626,
+    "sha256": "21a52fe1984f3b2934cb727c1ffd856b68a9544eea2cb20cf4478a9934641916",
+    "pages": 24,
+    "documents": 3,
+    "pagesVisitedPerDocument": 6
+  },
+  "memory": {
+    "metric": "WebContent physical footprint",
+    "unit": "bytes",
+    "checkpoints": {
+      "after_three_document_traversal": {
+        "before": 574112800,
+        "after": 405504888
+      },
+      "hidden_after_18_seconds": {
+        "before": 241009696,
+        "after": 136217608
+      },
+      "after_showing_again": {
+        "before": 324846624,
+        "after": 214107144
+      },
+      "observed_peak": {
+        "before": 703775776,
+        "after": 680723392
+      }
+    },
+    "note": "RSSとは異なる指標。単発の観測値は回収・圧縮のタイミングでも変動し、あらゆるPDFでの上限や恒常的な削減率を保証しない。"
+  },
+  "rendering": {
+    "maximumConcurrentRenders": {
+      "before": 8,
+      "after": 1
+    },
+    "rendersPerResume": {
+      "before": 2,
+      "after": 1
+    },
+    "singleCanvasPixelsAt300Percent": {
+      "before": 17449344,
+      "after": 8383230
+    },
+    "documentsAfterHidden18Seconds": {
+      "before": 3,
+      "after": 0
+    },
+    "canvasPixelsAfterHidden18Seconds": {
+      "before": 2401440,
+      "after": 0
+    }
+  },
+  "verification": {
+    "wkWebView": {
+      "passed": 11,
+      "total": 11,
+      "assertions": {
+        "at most two loaded PDF documents": true,
+        "at most one simultaneous render": true,
+        "single canvas within 8 Mi pixels": true,
+        "latest page wins after render burst": true,
+        "each document displays its requested page": true,
+        "all fixture thumbnails rendered": true,
+        "hidden documents released": true,
+        "hidden canvases released": true,
+        "reading position restored": true,
+        "text selection restored": true,
+        "renderer termination delivered": true
+      },
+      "consoleWarningsOrErrors": 0,
+      "externalInputEvents": 0,
+      "pdfBodyAndTextSelectionRestored": true,
+      "renderedThumbnails": 24
+    },
+    "javascriptTests": {
+      "passed": 21,
+      "total": 21
+    },
+    "rustTests": {
+      "passed": 10,
+      "total": 10
+    },
+    "nativeTauri": {
+      "isolatedData": true,
+      "rendererSIGKILL": {
+        "replacementRendererStarted": true,
+        "reloadConfirmed": true,
+        "restoredSettings": {
+          "page": 10,
+          "zoomPercent": 133,
+          "spread": true
+        },
+        "bookshelfSwitchResponded": true,
+        "pdfBodyVisuallyConfirmedAfterReload": false,
+        "limitation": "自動操作中のウィンドウ遮蔽で描画が休止したため、実Tauriでのreload後のPDF本文目視は未確定。独立WKWebView試験の本文復帰成功と区別する。"
+      },
+      "rendererSIGSTOPThenCmdQ": {
+        "appAndRendererExited": true
+      },
+      "normalClose": {
+        "exited": true,
+        "readingSettingsSaved": true
+      }
+    }
+  },
+  "limitations": {
+    "fullComputerSleepTested": false,
+    "intentional4GBMemoryPressureTested": false,
+    "strict15SecondReleaseDeadlineGuaranteed": false,
+    "reason": "非表示・再表示と専用描画プロセスへの信号で検証した。背景JSタイマーはWebKitにより遅延することがある。"
+  }
+}

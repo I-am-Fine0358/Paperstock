@@ -9,8 +9,11 @@ use std::{
         Arc, Mutex,
     },
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+const MAX_REQUEST_HEADER_BYTES: usize = 8192;
+const REQUEST_HEADER_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct PdfServer {
     port: u16,
@@ -65,15 +68,22 @@ impl PdfServer {
 }
 
 fn handle_connection(mut stream: TcpStream, files: Arc<Mutex<HashMap<String, PathBuf>>>) {
-    let mut buf = [0_u8; 8192];
-    let Ok(n) = stream.read(&mut buf) else {
-        return;
+    let _ = stream.set_write_timeout(Some(REQUEST_HEADER_TIMEOUT));
+    let headers = match read_request_headers(&mut stream, REQUEST_HEADER_TIMEOUT) {
+        Ok(headers) => headers,
+        Err(error) => {
+            let (status, reason) = match error.kind() {
+                std::io::ErrorKind::InvalidData => (431, "Request Header Fields Too Large"),
+                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => {
+                    (408, "Request Timeout")
+                }
+                _ => (400, "Bad Request"),
+            };
+            write_status(&mut stream, status, reason);
+            return;
+        }
     };
-    if n == 0 {
-        return;
-    }
-
-    let request = String::from_utf8_lossy(&buf[..n]);
+    let request = String::from_utf8_lossy(&headers);
     let mut lines = request.lines();
     let Some(request_line) = lines.next() else {
         write_status(&mut stream, 400, "Bad Request");
@@ -122,6 +132,49 @@ fn handle_connection(mut stream: TcpStream, files: Arc<Mutex<HashMap<String, Pat
         range_header.as_deref(),
     ) {
         let _ = stream.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+fn read_request_headers(stream: &mut TcpStream, timeout: Duration) -> std::io::Result<Vec<u8>> {
+    let deadline = Instant::now() + timeout;
+    let mut buffer = [0_u8; MAX_REQUEST_HEADER_BYTES];
+    let mut length = 0;
+    loop {
+        // TCP reads do not preserve HTTP header boundaries. In particular the
+        // Range header can arrive after the request line in a separate packet.
+        if let Some(end) = buffer[..length]
+            .windows(4)
+            .position(|bytes| bytes == b"\r\n\r\n")
+        {
+            return Ok(buffer[..end + 4].to_vec());
+        }
+        if length == buffer.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "HTTP headers exceed 8 KiB",
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "HTTP headers timed out",
+            ));
+        }
+        // Reset to the remaining *total* time, so trickled bytes cannot keep a
+        // connection thread alive indefinitely by resetting a per-read timeout.
+        stream.set_read_timeout(Some(remaining))?;
+        match stream.read(&mut buffer[length..]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "Incomplete HTTP headers",
+                ))
+            }
+            Ok(read) => length += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
     }
 }
 
@@ -223,6 +276,59 @@ fn write_headers(
 mod tests {
     use super::*;
     use std::{fs, io::Read, net::TcpStream, time::Duration};
+
+    fn connected_pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+
+    #[test]
+    fn waits_for_fragmented_headers_including_range() {
+        let (mut client, mut server) = connected_pair();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let reader = thread::spawn(move || {
+            sender
+                .send(read_request_headers(&mut server, Duration::from_secs(2)))
+                .unwrap();
+        });
+        client.write_all(b"GET /pdf/test HTTP/1.1\r\n").unwrap();
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        client.write_all(b"Host: localhost\r\nRan").unwrap();
+        client.write_all(b"ge: bytes=5-9\r\n\r\n").unwrap();
+        let headers = receiver
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            headers,
+            b"GET /pdf/test HTTP/1.1\r\nHost: localhost\r\nRange: bytes=5-9\r\n\r\n"
+        );
+        reader.join().unwrap();
+    }
+
+    #[test]
+    fn rejects_headers_over_the_fixed_buffer_limit() {
+        let (mut client, mut server) = connected_pair();
+        client.write_all(&[b'x'; MAX_REQUEST_HEADER_BYTES]).unwrap();
+        let error = read_request_headers(&mut server, Duration::from_secs(2)).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn incomplete_headers_have_a_read_deadline() {
+        let (mut client, mut server) = connected_pair();
+        client.write_all(b"GET /pdf/test HTTP/1.1\r\n").unwrap();
+        let error = read_request_headers(&mut server, Duration::from_millis(30)).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+        ));
+    }
 
     #[test]
     fn serves_byte_ranges_without_loading_whole_file() {

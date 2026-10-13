@@ -49,6 +49,30 @@ fn cleanup_dir(dir: &Path) {
     let _ = fs::remove_dir(dir);
 }
 
+fn comparable_path(path: &Path) -> String {
+    let normalized = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut s = normalized.to_string_lossy().replace('\\', "/");
+    while s.ends_with('/') {
+        s.pop();
+    }
+
+    if cfg!(target_os = "macos") {
+        s.to_lowercase()
+    } else {
+        s
+    }
+}
+
+pub fn paths_equivalent(left: &Path, right: &Path) -> bool {
+    comparable_path(left) == comparable_path(right)
+}
+
+pub fn path_is_inside_dir(path: &Path, dir: &Path) -> bool {
+    let path = comparable_path(path);
+    let dir = comparable_path(dir);
+    path == dir || path.starts_with(&format!("{}/", dir))
+}
+
 /// Get PDF page count using lopdf
 pub fn get_page_count(pdf_path: &str) -> i64 {
     match lopdf::Document::load(pdf_path) {
@@ -82,11 +106,13 @@ fn fallback_page_count(pdf_path: &str) -> i64 {
 
 /// Migrate existing books whose file_path is outside pdfs_dir
 pub fn migrate_existing_books(db: &crate::db::BookDatabase, pdfs_dir: &str) {
+    let managed_dir = Path::new(pdfs_dir);
     let books = db.get_all_books();
     for book in books {
-        if !book.file_path.starts_with(pdfs_dir) {
-            if Path::new(&book.file_path).exists() {
-                let basename = Path::new(&book.file_path)
+        let source_path = Path::new(&book.file_path);
+        if !path_is_inside_dir(source_path, managed_dir) {
+            if source_path.exists() {
+                let basename = source_path
                     .file_name()
                     .unwrap_or_default()
                     .to_string_lossy()

@@ -1349,10 +1349,63 @@ body.night-mode .book-folder-overlay {
   background: white;
   box-shadow: 0 2px 12px rgba(0, 0, 0, 0.3);
   border-radius: 2px;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 .page-canvas {
   display: block;
+  position: relative;
+  z-index: 1;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.textLayer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  line-height: 1;
+  opacity: 1;
+  pointer-events: auto;
+  text-align: initial;
+  transform-origin: 0 0;
+  z-index: 2;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.textLayer span,
+.textLayer br {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0 0;
+  user-select: text;
+  -webkit-user-select: text;
+}
+
+.textLayer span {
+  font-size: calc(var(--font-height) * var(--total-scale-factor));
+  transform: scaleX(var(--scale-x, 1)) rotate(var(--rotate, 0deg));
+}
+
+.textLayer .markedContent {
+  position: absolute;
+  top: 0;
+  height: 0;
+}
+
+.textLayer ::selection {
+  background: rgba(0, 122, 255, 0.35);
+}
+
+.viewer-container.comment-mode .textLayer,
+.viewer-container.comment-mode .textLayer * {
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 .viewer-loading {

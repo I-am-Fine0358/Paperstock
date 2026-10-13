@@ -8,25 +8,17 @@ use crate::models::{Book, BookUpdate};
 
 fn book_path_matches(book: &Book, path: &Path) -> bool {
     let book_path = Path::new(&book.file_path);
-    let normalized_path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    if book_path == path {
-        return true;
-    }
-
-    book_path
-        .canonicalize()
-        .map(|p| p == normalized_path)
-        .unwrap_or_else(|_| book.file_path == path.to_string_lossy())
+    crate::pdf_utils::paths_equivalent(book_path, path)
 }
 
 /// Return the managed pdfs directory: ~/Library/Application Support/Paperstock/pdfs
 fn pdfs_dir() -> PathBuf {
-    dirs::data_dir().unwrap().join("Paperstock").join("pdfs")
+    crate::data_paths::user_data_dir().join("pdfs")
 }
 
 /// Return the managed covers directory: ~/Library/Application Support/Paperstock/covers
 fn covers_dir() -> PathBuf {
-    dirs::data_dir().unwrap().join("Paperstock").join("covers")
+    crate::data_paths::user_data_dir().join("covers")
 }
 
 #[tauri::command]
@@ -81,14 +73,13 @@ pub async fn import_pdf(
 
     let source = Path::new(&file_path);
     let source_path = source.canonicalize().map_err(|e| e.to_string())?;
-    let managed_dir = pdfs_dir.canonicalize().unwrap_or_else(|_| pdfs_dir.clone());
     let basename = source
         .file_name()
         .ok_or_else(|| "Invalid file path".to_string())?;
 
     let books = db.get_all_books();
 
-    if source_path.starts_with(&managed_dir) {
+    if crate::pdf_utils::path_is_inside_dir(&source_path, &pdfs_dir) {
         if let Some(book) = books.iter().find(|b| book_path_matches(b, &source_path)) {
             return Ok(Some(book.clone()));
         }

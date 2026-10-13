@@ -1,11 +1,37 @@
 use std::sync::Mutex;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, Row};
 
 use crate::models::*;
 
 pub struct BookDatabase {
     pub conn: Mutex<Connection>,
+}
+
+const BOOK_COLUMNS: &str = "id, title, file_path, cover_path, page_count, status, favorite, last_opened_at, last_page, last_scroll_y, last_zoom, last_spread_mode, last_spread_direction, created_at, updated_at";
+const BOOK_COLUMNS_PREFIXED: &str = "b.id, b.title, b.file_path, b.cover_path, b.page_count, b.status, b.favorite, b.last_opened_at, b.last_page, b.last_scroll_y, b.last_zoom, b.last_spread_mode, b.last_spread_direction, b.created_at, b.updated_at";
+
+fn map_book_row(row: &Row<'_>) -> rusqlite::Result<Book> {
+    Ok(Book {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        file_path: row.get(2)?,
+        cover_path: row.get(3)?,
+        page_count: row.get(4)?,
+        status: row
+            .get::<_, Option<String>>(5)?
+            .unwrap_or_else(|| "unread".to_string()),
+        favorite: row.get::<_, Option<i64>>(6)?.unwrap_or(0),
+        last_opened_at: row.get(7)?,
+        last_page: row.get::<_, Option<i64>>(8)?.unwrap_or(1),
+        last_scroll_y: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
+        last_zoom: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
+        last_spread_mode: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
+        last_spread_direction: row.get::<_, Option<i64>>(12)?.unwrap_or(1),
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
+        tags: Vec::new(),
+    })
 }
 
 impl BookDatabase {
@@ -160,34 +186,9 @@ impl BookDatabase {
     pub fn get_book(&self, id: i64) -> Option<Book> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare(
-                "SELECT id, title, file_path, cover_path, page_count, status, favorite, last_opened_at, last_page, last_scroll_y, last_zoom, last_spread_mode, last_spread_direction, created_at, updated_at FROM books WHERE id = ?1",
-            )
+            .prepare(&format!("SELECT {} FROM books WHERE id = ?1", BOOK_COLUMNS))
             .ok()?;
-        let mut book = stmt
-            .query_row(params![id], |row| {
-                Ok(Book {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    file_path: row.get(2)?,
-                    cover_path: row.get(3)?,
-                    page_count: row.get(4)?,
-                    status: row
-                        .get::<_, Option<String>>(5)?
-                        .unwrap_or_else(|| "unread".to_string()),
-                    favorite: row.get::<_, Option<i64>>(6)?.unwrap_or(0),
-                    last_opened_at: row.get(7)?,
-                    last_page: row.get::<_, Option<i64>>(8)?.unwrap_or(1),
-                    last_scroll_y: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
-                    last_zoom: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
-                    last_spread_mode: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
-                    last_spread_direction: row.get::<_, Option<i64>>(12)?.unwrap_or(1),
-                    created_at: row.get(13)?,
-                    updated_at: row.get(14)?,
-                    tags: Vec::new(),
-                })
-            })
-            .ok()?;
+        let mut book = stmt.query_row(params![id], map_book_row).ok()?;
         let tags = Self::get_book_tags_with_conn(&conn, book.id);
         book.tags = tags;
         Some(book)
@@ -196,33 +197,13 @@ impl BookDatabase {
     pub fn get_all_books(&self) -> Vec<Book> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare(
-                "SELECT id, title, file_path, cover_path, page_count, status, favorite, last_opened_at, last_page, last_scroll_y, last_zoom, last_spread_mode, last_spread_direction, created_at, updated_at FROM books ORDER BY updated_at DESC",
-            )
+            .prepare(&format!(
+                "SELECT {} FROM books ORDER BY updated_at DESC",
+                BOOK_COLUMNS
+            ))
             .expect("Failed to prepare get_all_books");
         let books = stmt
-            .query_map([], |row| {
-                Ok(Book {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    file_path: row.get(2)?,
-                    cover_path: row.get(3)?,
-                    page_count: row.get(4)?,
-                    status: row
-                        .get::<_, Option<String>>(5)?
-                        .unwrap_or_else(|| "unread".to_string()),
-                    favorite: row.get::<_, Option<i64>>(6)?.unwrap_or(0),
-                    last_opened_at: row.get(7)?,
-                    last_page: row.get::<_, Option<i64>>(8)?.unwrap_or(1),
-                    last_scroll_y: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
-                    last_zoom: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
-                    last_spread_mode: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
-                    last_spread_direction: row.get::<_, Option<i64>>(12)?.unwrap_or(1),
-                    created_at: row.get(13)?,
-                    updated_at: row.get(14)?,
-                    tags: Vec::new(),
-                })
-            })
+            .query_map([], map_book_row)
             .expect("Failed to query books")
             .filter_map(|r| r.ok())
             .collect::<Vec<_>>();
@@ -237,33 +218,13 @@ impl BookDatabase {
     pub fn get_books_by_tag(&self, tag_id: i64) -> Vec<Book> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn
-            .prepare(
-                "SELECT b.id, b.title, b.file_path, b.cover_path, b.page_count, b.status, b.favorite, b.last_opened_at, b.last_page, b.last_scroll_y, b.last_zoom, b.last_spread_mode, b.last_spread_direction, b.created_at, b.updated_at FROM books b JOIN book_tags bt ON b.id = bt.book_id WHERE bt.tag_id = ?1 ORDER BY b.updated_at DESC",
-            )
+            .prepare(&format!(
+                "SELECT {} FROM books b JOIN book_tags bt ON b.id = bt.book_id WHERE bt.tag_id = ?1 ORDER BY b.updated_at DESC",
+                BOOK_COLUMNS_PREFIXED
+            ))
             .expect("Failed to prepare get_books_by_tag");
         let books = stmt
-            .query_map(params![tag_id], |row| {
-                Ok(Book {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    file_path: row.get(2)?,
-                    cover_path: row.get(3)?,
-                    page_count: row.get(4)?,
-                    status: row
-                        .get::<_, Option<String>>(5)?
-                        .unwrap_or_else(|| "unread".to_string()),
-                    favorite: row.get::<_, Option<i64>>(6)?.unwrap_or(0),
-                    last_opened_at: row.get(7)?,
-                    last_page: row.get::<_, Option<i64>>(8)?.unwrap_or(1),
-                    last_scroll_y: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
-                    last_zoom: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
-                    last_spread_mode: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
-                    last_spread_direction: row.get::<_, Option<i64>>(12)?.unwrap_or(1),
-                    created_at: row.get(13)?,
-                    updated_at: row.get(14)?,
-                    tags: Vec::new(),
-                })
-            })
+            .query_map(params![tag_id], map_book_row)
             .expect("Failed to query books by tag")
             .filter_map(|r| r.ok())
             .collect::<Vec<_>>();
@@ -279,33 +240,13 @@ impl BookDatabase {
         let conn = self.conn.lock().unwrap();
         let pattern = format!("%{}%", query);
         let mut stmt = conn
-            .prepare(
-                "SELECT id, title, file_path, cover_path, page_count, status, favorite, last_opened_at, last_page, last_scroll_y, last_zoom, last_spread_mode, last_spread_direction, created_at, updated_at FROM books WHERE title LIKE ?1 ORDER BY updated_at DESC",
-            )
+            .prepare(&format!(
+                "SELECT {} FROM books WHERE title LIKE ?1 ORDER BY updated_at DESC",
+                BOOK_COLUMNS
+            ))
             .expect("Failed to prepare search_books");
         let books = stmt
-            .query_map(params![pattern], |row| {
-                Ok(Book {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    file_path: row.get(2)?,
-                    cover_path: row.get(3)?,
-                    page_count: row.get(4)?,
-                    status: row
-                        .get::<_, Option<String>>(5)?
-                        .unwrap_or_else(|| "unread".to_string()),
-                    favorite: row.get::<_, Option<i64>>(6)?.unwrap_or(0),
-                    last_opened_at: row.get(7)?,
-                    last_page: row.get::<_, Option<i64>>(8)?.unwrap_or(1),
-                    last_scroll_y: row.get::<_, Option<f64>>(9)?.unwrap_or(0.0),
-                    last_zoom: row.get::<_, Option<f64>>(10)?.unwrap_or(0.0),
-                    last_spread_mode: row.get::<_, Option<i64>>(11)?.unwrap_or(0),
-                    last_spread_direction: row.get::<_, Option<i64>>(12)?.unwrap_or(1),
-                    created_at: row.get(13)?,
-                    updated_at: row.get(14)?,
-                    tags: Vec::new(),
-                })
-            })
+            .query_map(params![pattern], map_book_row)
             .expect("Failed to search books")
             .filter_map(|r| r.ok())
             .collect::<Vec<_>>();

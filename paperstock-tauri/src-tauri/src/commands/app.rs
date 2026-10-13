@@ -1,4 +1,9 @@
 #[tauri::command]
+pub fn request_app_quit(app: tauri::AppHandle) {
+    crate::shutdown::request(&app);
+}
+
+#[tauri::command]
 pub fn quit_app(app: tauri::AppHandle) {
-    app.exit(0);
+    crate::shutdown::finish(&app);
 }

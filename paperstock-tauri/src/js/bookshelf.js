@@ -32,6 +32,11 @@ let pointerBookDrag = null;
 const BOOK_FOLDER_PREVIEW_LIMIT = 9;
 const BOOK_STACKS_STORAGE_KEY = 'ps-book-stacks';
 const BOOK_STACK_DRAG_THRESHOLD = 8;
+const PDF_CONTENT_SEARCH_MIN_CHARS = 2;
+const MAX_TEXT_LAYER_ITEMS = 8000;
+const MAX_TEXT_LAYER_CHARS = 120000;
+let pdfContentSearchCache = new Map();
+let renderBooksRequestId = 0;
 
 // Tab system
 let tabs = [];
@@ -44,6 +49,134 @@ let nextGroupId = 1;
 let pdfStates = {};
 let pdfjsLib = null;
 let pdfjsReady = false;
+let pdfjsInitPromise = null;
+
+// Keep at most the current document and one recent tab warm. Canvas limits apply
+// to the whole spread, including the old frame retained during an atomic swap.
+const PDF_MAX_LOADED_DOCUMENTS = 2;
+const PDF_INACTIVE_EVICT_MS = 60000;
+const PDF_HIDDEN_RELEASE_MS = 15000;
+const PDF_VIEWER_FRAME_PIXELS = 8 * 1024 * 1024;
+const PDF_CANVAS_MAX_DIMENSION = 4096;
+let pdfWorkTail = Promise.resolve();
+let pdfBackgroundTimer = null;
+let pdfBackgroundDeadline = 0;
+let pdfLastUsedOrder = 0;
+const pdfPendingDestructions = new Set();
+
+function enqueuePdfWork(work) {
+    const pending = pdfWorkTail.then(work);
+    pdfWorkTail = pending.catch(error => console.warn('PDF task failed:', error));
+    return pdfWorkTail;
+}
+
+function releaseCanvasTree(root) {
+    if (!root) return;
+    root.querySelectorAll('canvas').forEach(canvas => {
+        canvas.width = 0;
+        canvas.height = 0;
+    });
+    root.replaceChildren();
+}
+
+function cancelPdfRendering(state) {
+    state.renderGeneration = (state.renderGeneration || 0) + 1;
+    if (state.renderTasks?.size) state.renderCancelledAt = Date.now();
+    for (const task of state.renderTasks || []) task.cancel();
+    for (const layer of state.textLayers || []) layer.cancel();
+    for (const reader of state.textReaders || []) {
+        reader.cancel(new Error('PDF text rendering cancelled')).catch(() => {});
+    }
+}
+
+function cancelThumbnailRendering(state, clear = false) {
+    state.thumbnailGeneration = (state.thumbnailGeneration || 0) + 1;
+    if (state.thumbnailTask) state.renderCancelledAt = Date.now();
+    state.thumbnailTask?.cancel();
+    if (clear) {
+        const list = document.getElementById('thumbnail-list');
+        if (list?.dataset.tabId === state.tabId) {
+            releaseCanvasTree(list);
+            delete list.dataset.tabId;
+        }
+    }
+}
+
+function rememberPdfScroll(state) {
+    const pages = document.getElementById('viewer-pages');
+    const viewer = document.getElementById('viewer-container');
+    if (state.tabId === activeTabId && pages?.dataset.tabId === state.tabId && pages.scrollHeight > 0) {
+        state.pendingScrollY = viewer.scrollTop / pages.scrollHeight;
+        state.savedScrollY = state.pendingScrollY;
+    }
+}
+
+function releasePdfDocument(state) {
+    if (state.releasePromise) {
+        // A tab can be reopened while destruction is pending, then hidden again.
+        // Invalidate that waiting load as well instead of letting it revive in the background.
+        state.loadGeneration = (state.loadGeneration || 0) + 1;
+        state.loading = false;
+        cancelPdfRendering(state);
+        cancelThumbnailRendering(state, true);
+        return state.releasePromise;
+    }
+    rememberPdfScroll(state);
+    if (state.loaded) saveBookState(state.tabId).catch(error => console.warn('Failed to save PDF position:', error));
+    clearTimeout(state.evictionTimer);
+    state.loadGeneration = (state.loadGeneration || 0) + 1;
+    cancelPdfRendering(state);
+    cancelThumbnailRendering(state, true);
+    const loadingTask = state.loadingTask;
+    const doc = state.pdfDoc;
+    state.pdfDoc = null;
+    state.loadingTask = null;
+    state.loaded = false;
+    state.loading = false;
+    const pages = document.getElementById('viewer-pages');
+    if (pages?.dataset.tabId === state.tabId) {
+        releaseCanvasTree(pages);
+        delete pages.dataset.tabId;
+    }
+    // destroy() also aborts network requests and terminates this document's worker.
+    const releasePromise = Promise.resolve().then(() => loadingTask ? loadingTask.destroy() : doc?.destroy())
+        .catch(error => console.warn('PDF release failed:', error))
+        .finally(() => {
+            pdfPendingDestructions.delete(releasePromise);
+            if (state.releasePromise === releasePromise) state.releasePromise = null;
+        });
+    state.releasePromise = releasePromise;
+    // Keep tracking destruction even when closeTab immediately removes its state.
+    pdfPendingDestructions.add(releasePromise);
+    return releasePromise;
+}
+
+function enforcePdfDocumentLimit(activeId) {
+    const inactive = Object.values(pdfStates)
+        .filter(state => state.tabId !== activeId && (state.pdfDoc || state.loading))
+        .sort((a, b) => (b.lastUsedOrder || 0) - (a.lastUsedOrder || 0));
+    // Reserve a slot for the document about to load as well.
+    for (const state of inactive.slice(PDF_MAX_LOADED_DOCUMENTS - 1)) releasePdfDocument(state);
+    // A replacement must also wait for workers already being destroyed, otherwise
+    // quick tab switching can temporarily create an unbounded number of workers.
+    return Promise.all(pdfPendingDestructions);
+}
+
+function schedulePdfBackgroundRelease(delay = PDF_HIDDEN_RELEASE_MS) {
+    // macOS can send visibility, blur, pageshow and focus in different orders.
+    // Hidden documents must keep the earliest release deadline, never extend it.
+    if (document.visibilityState === 'hidden') delay = Math.min(delay, PDF_HIDDEN_RELEASE_MS);
+    const deadline = Date.now() + delay;
+    if (pdfBackgroundTimer !== null && pdfBackgroundDeadline <= deadline) return;
+    clearTimeout(pdfBackgroundTimer);
+    pdfBackgroundDeadline = deadline;
+    pdfBackgroundTimer = setTimeout(() => {
+        pdfBackgroundTimer = null;
+        pdfBackgroundDeadline = 0;
+        persistTabState();
+        for (const state of Object.values(pdfStates)) releasePdfDocument(state);
+    }, delay);
+}
 
 // Comment state
 let commentMode = false;
@@ -235,6 +368,13 @@ function restoreTabState() {
 }
 
 async function initPdfJs() {
+    if (pdfjsReady) return;
+    if (pdfjsInitPromise) return pdfjsInitPromise;
+    pdfjsInitPromise = initializePdfJs().finally(() => { pdfjsInitPromise = null; });
+    return pdfjsInitPromise;
+}
+
+async function initializePdfJs() {
     try {
         // Tauri serves .mjs with wrong MIME type, so use fetch + blob URL workaround
         const resp = await fetch('./libs/pdf.mjs');
@@ -288,19 +428,15 @@ function openPdfTab(bookId) {
 async function closeTab(tabId) {
     const idx = tabs.findIndex(t => t.id === tabId);
     if (idx === -1) return;
-    if (pdfStates[tabId]) {
-        const state = pdfStates[tabId];
-        // Cancel any pending debounced save and persist final state synchronously
-        if (saveStateTimers[tabId]) { clearTimeout(saveStateTimers[tabId]); delete saveStateTimers[tabId]; }
-        if (state.loaded && state.bookId) {
-            try { await saveBookState(tabId); } catch (_e) { /* best-effort */ }
-        }
-        if (state.pdfDoc) state.pdfDoc.destroy();
-        delete pdfStates[tabId];
-    }
+    const state = pdfStates[tabId];
+    if (saveStateTimers[tabId]) { clearTimeout(saveStateTimers[tabId]); delete saveStateTimers[tabId]; }
+    const released = state ? releasePdfDocument(state) : Promise.resolve();
+    if (state) state.closed = true;
+    delete pdfStates[tabId];
     tabs.splice(idx, 1);
     if (activeTabId === tabId) activateTab('bookshelf');
     renderTabBar();
+    await released;
 }
 
 // ── Reading Progress Bar ───────────────────────────────
@@ -471,9 +607,14 @@ function saveBookState(tabId) {
     if (activeTabId === tabId) {
         const viewerContainer = document.getElementById('viewer-container');
         const pagesContainer = document.getElementById('viewer-pages');
-        if (pagesContainer && pagesContainer.scrollHeight > 0) {
+        if (pagesContainer?.dataset.tabId === tabId && pagesContainer.scrollHeight > 0) {
             updates.lastScrollY = viewerContainer.scrollTop / pagesContainer.scrollHeight;
+            state.savedScrollY = updates.lastScrollY;
         }
+    }
+
+    if (updates.lastScrollY === undefined && Number.isFinite(state.savedScrollY)) {
+        updates.lastScrollY = state.savedScrollY;
     }
 
     // Update local cache so a subsequent re-open uses fresh values without an IPC round-trip
@@ -491,12 +632,31 @@ function saveBookState(tabId) {
 
 async function flushOpenPdfState() {
     persistTabState();
+    const saves = [];
     for (const tabId of Object.keys(pdfStates)) {
         if (saveStateTimers[tabId]) {
             clearTimeout(saveStateTimers[tabId]);
             delete saveStateTimers[tabId];
         }
-        await saveBookState(tabId);
+        // Start every save even if another tab's IPC fails or stops responding.
+        saves.push(Promise.resolve().then(() => saveBookState(tabId)));
+    }
+    const results = await Promise.allSettled(saves);
+    for (const result of results) {
+        if (result.status === 'rejected') console.warn('Failed to save reading state:', result.reason);
+    }
+}
+
+let appQuitInProgress = false;
+async function prepareAppQuit() {
+    if (appQuitInProgress) return;
+    appQuitInProgress = true;
+    try {
+        await flushOpenPdfState();
+    } finally {
+        // The native quit coordinator also has a deadline, so a dead renderer
+        // or stalled IPC can never prevent the user from closing the app.
+        await invoke('quit_app');
     }
 }
 
@@ -509,7 +669,27 @@ function scheduleSaveBookState(tabId, ms = 500) {
 }
 
 function activateTab(tabId) {
+    const previous = pdfStates[activeTabId];
+    if (previous && activeTabId !== tabId) {
+        rememberPdfScroll(previous);
+        saveBookState(activeTabId).catch(error => console.warn('Failed to save PDF position:', error));
+        cancelPdfRendering(previous);
+        cancelThumbnailRendering(previous, true);
+        if (previous.loading) releasePdfDocument(previous);
+        clearTimeout(previous.evictionTimer);
+        previous.evictionTimer = setTimeout(() => {
+            if (activeTabId !== previous.tabId) releasePdfDocument(previous);
+        }, PDF_INACTIVE_EVICT_MS);
+        releaseCanvasTree(document.getElementById('viewer-pages'));
+        delete document.getElementById('viewer-pages').dataset.tabId;
+    }
     activeTabId = tabId;
+    const current = pdfStates[tabId];
+    if (current) {
+        clearTimeout(current.evictionTimer);
+        current.lastUsedOrder = ++pdfLastUsedOrder;
+    }
+    enforcePdfDocumentLimit(tabId);
     document.querySelectorAll('.tab-item').forEach(el => {
         el.classList.toggle('active', el.dataset.tabId === tabId);
     });
@@ -526,7 +706,7 @@ function activateTab(tabId) {
         bookshelfView.classList.remove('active');
         viewerView.classList.add('active');
         // Lazy-load: restored tabs (from previous session) have no pdfStates entry yet
-        if (!pdfStates[tabId]) {
+        if (!pdfStates[tabId]?.loaded && !pdfStates[tabId]?.loading) {
             const tab = tabs.find(t => t.id === tabId);
             const book = tab ? allBooks.find(b => b.id === tab.bookId) : null;
             if (!book) {
@@ -541,7 +721,7 @@ function activateTab(tabId) {
     persistTabState();
 }
 
-function showPdfTab(tabId) {
+function showPdfTab(tabId, preserveScroll = false) {
     const state = pdfStates[tabId];
     if (!state) return;
 
@@ -579,54 +759,42 @@ function showPdfTab(tabId) {
         const sidebar = document.getElementById('viewer-sidebar');
         sidebar.classList.toggle('open', state.thumbnailsOpen || false);
 
-        // If fit calc was deferred (loaded while viewer was hidden), recompute
-        // now that the container is laid out, then render.
-        if (state.fitNeedsRecompute) {
-            ensureFitScale(state).then(() => {
-                if (activeTabId === tabId) renderPdfPages(tabId);
-            });
-        } else {
-            renderPdfPages(tabId);
-        }
+        // The render queue owns fit calculation and performs one render per request.
+        renderPdfPages(tabId, preserveScroll);
     }
 }
 
 let resumeRecoveryTimer = null;
-function scheduleResumeRecovery(_reason = 'resume') {
+let resumeNeedsRender = false;
+function scheduleResumeRecovery(reason = 'resume') {
+    resumeNeedsRender ||= reason === 'paperstock-system-resumed';
+    // A focus/pageshow event can arrive while the WebView is still hidden.
+    // Only confirmed visibility is allowed to cancel its memory-release timer.
+    if (document.visibilityState === 'hidden') return;
+    clearTimeout(pdfBackgroundTimer);
+    pdfBackgroundTimer = null;
+    pdfBackgroundDeadline = 0;
     clearTimeout(resumeRecoveryTimer);
     resumeRecoveryTimer = setTimeout(async () => {
+        if (document.visibilityState === 'hidden') return;
         document.body.classList.add('resume-repaint');
         requestAnimationFrame(() => document.body.classList.remove('resume-repaint'));
-
         applyTheme();
-
         if (activeTabId === 'bookshelf') {
-            try { await loadData(); } catch (e) { console.warn('Failed to refresh bookshelf after resume:', e); }
             renderBooks();
-            renderTags();
-            renderTabBar();
             return;
         }
-
-        const state = pdfStates[activeTabId];
-        if (!state) {
-            activateTab(activeTabId);
-            return;
-        }
-
-        if (state.loaded) {
-            if (state.fitNeedsRecompute) {
-                await ensureFitScale(state);
-            }
-            showPdfTab(activeTabId);
-            renderPdfPages(activeTabId, true);
-            return;
-        }
-
-        if (!state.loading) {
-            const tab = tabs.find(t => t.id === activeTabId);
-            const book = tab ? allBooks.find(b => b.id === tab.bookId) : null;
-            if (book) loadPdfForTab(activeTabId, book);
+        const tabId = activeTabId;
+        const state = pdfStates[tabId];
+        const forceRender = resumeNeedsRender;
+        resumeNeedsRender = false;
+        if (!state?.loaded) {
+            activateTab(tabId);
+        } else if (forceRender || state.needsRender ||
+                   document.getElementById('viewer-pages').dataset.tabId !== tabId) {
+            showPdfTab(tabId, true);
+        } else if (state.thumbnailsOpen) {
+            generateThumbnails(tabId);
         }
     }, 150);
 }
@@ -827,7 +995,7 @@ function getSpreadDirectionIcon(rtl) {
     `;
 }
 
-async function ensureFitScale(state) {
+async function ensureFitScale(state, isCurrent = () => true) {
     if (!state || !state.fitMode || !state.pdfDoc) return;
     const container = document.getElementById('viewer-container');
     if (!container || container.clientWidth <= 0 || container.clientHeight <= 0) {
@@ -837,6 +1005,7 @@ async function ensureFitScale(state) {
     try {
         const pageNum = Math.max(1, Math.min(state.currentPage || 1, state.totalPages || state.currentPage || 1));
         const page = await state.pdfDoc.getPage(pageNum);
+        if (!isCurrent()) return;
         const viewport = page.getViewport({ scale: 1.0 });
         const fitType = getFitType(state);
         let targetSize = 0;
@@ -866,214 +1035,250 @@ async function ensureFitScale(state) {
 }
 
 async function loadPdfForTab(tabId, book) {
-    // Guard against duplicate concurrent calls for the same tab (openPdfTab + activateTab lazy-load).
-    if (pdfStates[tabId] && pdfStates[tabId].loading) return;
-
-    const restoredZoom = book.lastZoom && book.lastZoom > 0 ? book.lastZoom : null;
-    pdfStates[tabId] = {
-        title: book.title,
-        pdfDoc: null,
-        currentPage: book.lastPage || 1,
-        totalPages: 0,
-        scale: restoredZoom || 1.0,
-        fitMode: !restoredZoom, // if no saved zoom, use fit-to-width default
-        fitType: restoredZoom ? 'none' : 'autoWidth',
-        fitNeedsRecompute: !restoredZoom,
-        thumbnailsOpen: false,
-        loaded: false,
-        loading: true,
-        bookId: book.id,
-        spreadMode: !!book.lastSpreadMode,
-        spreadDirection: book.lastSpreadDirection === 0 ? 'ltr' : 'rtl',
-        scrollDir: 'vertical',
-        comments: [],
-        bookmarks: [],
-        pendingScrollY: book.lastScrollY || 0, // ratio 0-1, applied after first render
-    };
-
-    if (activeTabId === tabId) {
-        document.getElementById('viewer-loading').style.display = 'flex';
-        document.getElementById('viewer-title').textContent = book.title;
+    if (!tabs.some(tab => tab.id === tabId)) return;
+    let state = pdfStates[tabId];
+    if (state?.loading || state?.loaded) return;
+    if (!state) {
+        const restoredZoom = book.lastZoom && book.lastZoom > 0 ? book.lastZoom : null;
+        state = pdfStates[tabId] = {
+            tabId,
+            title: book.title,
+            pdfDoc: null,
+            loadingTask: null,
+            currentPage: book.lastPage || 1,
+            totalPages: 0,
+            scale: restoredZoom || 1.0,
+            fitMode: !restoredZoom,
+            fitType: restoredZoom ? 'none' : 'autoWidth',
+            fitNeedsRecompute: !restoredZoom,
+            thumbnailsOpen: false,
+            loaded: false,
+            loading: false,
+            bookId: book.id,
+            spreadMode: !!book.lastSpreadMode,
+            spreadDirection: book.lastSpreadDirection === 0 ? 'ltr' : 'rtl',
+            scrollDir: 'vertical',
+            comments: [],
+            bookmarks: [],
+            pendingScrollY: book.lastScrollY || 0,
+            savedScrollY: book.lastScrollY || 0,
+            renderTasks: new Set(),
+            textLayers: new Set(),
+        };
     }
-
-    const loadingEl = document.getElementById('viewer-loading');
-    const showStep = (msg) => { if (loadingEl) loadingEl.querySelector('p').textContent = msg; };
-
-    if (!pdfjsReady) {
+    state.loading = true;
+    state.lastUsedOrder = ++pdfLastUsedOrder;
+    const generation = state.loadGeneration = (state.loadGeneration || 0) + 1;
+    const isCurrent = () => pdfStates[tabId] === state && !state.closed && state.loadGeneration === generation;
+    const showStep = (message) => {
+        if (!isCurrent() || activeTabId !== tabId) return;
+        const loading = document.getElementById('viewer-loading');
+        loading.style.display = 'flex';
+        loading.replaceChildren();
+        const paragraph = document.createElement('p');
+        paragraph.textContent = message;
+        loading.appendChild(paragraph);
+    };
+    try {
+        await state.releasePromise;
+        if (!isCurrent()) return;
+        await enforcePdfDocumentLimit(tabId);
+        if (!isCurrent()) return;
         showStep('PDF.js初期化中…');
         await initPdfJs();
-        if (!pdfjsReady) {
-            if (loadingEl) loadingEl.innerHTML = `<p style="color:#ff3b30">PDF.js初期化失敗</p><p style="color:#999;font-size:11px;max-width:500px;word-break:break-all;padding:0 20px">${pdfjsInitError}</p>`;
-            return;
-        }
-    }
-
-    try {
+        if (!isCurrent()) return;
+        if (!pdfjsReady) throw new Error(pdfjsInitError || 'PDF.js初期化失敗');
         showStep('PDF読み込み中…');
         const pdfUrl = await invoke('get_pdf_stream_url', { filePath: book.filePath });
-        const doc = await pdfjsLib.getDocument({ url: pdfUrl }).promise;
-
-        const state = pdfStates[tabId];
-        if (!state) return;
-
+        if (!isCurrent()) return;
+        // Range-only loading avoids downloading every byte of a large PDF while idle.
+        const loadingTask = pdfjsLib.getDocument({
+            url: pdfUrl,
+            disableAutoFetch: true,
+            disableStream: true,
+            canvasMaxAreaInBytes: 16 * 1024 * 1024,
+        });
+        state.loadingTask = loadingTask;
+        const doc = await loadingTask.promise;
+        if (!isCurrent()) {
+            await loadingTask.destroy();
+            return;
+        }
         state.pdfDoc = doc;
         state.totalPages = doc.numPages;
+        state.currentPage = Math.max(1, Math.min(state.currentPage, doc.numPages));
+        const [comments, bookmarks] = await Promise.all([
+            invoke('get_comments', { bookId: book.id }),
+            invoke('get_bookmarks', { bookId: book.id }),
+        ]);
+        if (!isCurrent()) return;
+        state.comments = comments;
+        state.bookmarks = bookmarks;
+        state.fitNeedsRecompute = state.fitMode;
         state.loaded = true;
-
-        // Load comments & bookmarks
-        state.comments = await invoke('get_comments', { bookId: book.id });
-        state.bookmarks = await invoke('get_bookmarks', { bookId: book.id });
-
-        // Compute fit-width only if container is visible right now; otherwise
-        // showPdfTab will retry once the user switches back.
-        await ensureFitScale(state);
-
         state.loading = false;
         if (activeTabId === tabId) showPdfTab(tabId);
-    } catch (err) {
-        console.error('Failed to load PDF:', err);
-        if (pdfStates[tabId]) pdfStates[tabId].loading = false;
-        if (pdfStates[tabId] && activeTabId === tabId) {
+    } catch (error) {
+        if (!isCurrent()) return;
+        console.error('Failed to load PDF:', error);
+        await releasePdfDocument(state);
+        if (pdfStates[tabId] === state && activeTabId === tabId && !state.loading) {
             const loading = document.getElementById('viewer-loading');
-            loading.innerHTML = `
-        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#ff3b30" stroke-width="1.5">
-          <circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/>
-          <line x1="9" y1="9" x2="15" y2="15"/>
-        </svg>
-        <p style="color:#ff3b30">PDFの読み込みに失敗しました</p>
-        <p style="color:#999;font-size:11px;max-width:400px;word-break:break-all">${String(err.message || err)}</p>
-      `;
+            loading.style.display = 'flex';
+            loading.replaceChildren();
+            const paragraph = document.createElement('p');
+            paragraph.textContent = `PDFの読み込みに失敗しました: ${String(error.message || error)}`;
+            loading.appendChild(paragraph);
         }
     }
 }
 
-async function renderPdfPages(tabId, preserveScroll = false) {
+function getPdfCanvasSize(viewport, maxPixels, maxDpr = 2) {
+    if (!Number.isFinite(viewport.width) || !Number.isFinite(viewport.height) || viewport.width <= 0 || viewport.height <= 0) {
+        throw new Error('PDFページのサイズが無効です');
+    }
+    const outputScale = Math.min(window.devicePixelRatio || 1, maxDpr,
+        Math.sqrt(maxPixels / (viewport.width * viewport.height)),
+        PDF_CANVAS_MAX_DIMENSION / viewport.width, PDF_CANVAS_MAX_DIMENSION / viewport.height);
+    return {
+        width: Math.max(1, Math.floor(viewport.width * outputScale)),
+        height: Math.max(1, Math.floor(viewport.height * outputScale)),
+    };
+}
+
+async function cleanupPdfDocument(state, doc) {
+    if (state.pdfDoc !== doc) return;
+    // PDF.js defers operator-stream cancellation for 100 ms after RenderTask.cancel.
+    // Its render promise has already rejected at that point; wait for the stream
+    // before clearing shared image objects or starting the next queued render.
+    const remaining = 120 - (Date.now() - (state.renderCancelledAt || 0));
+    if (remaining > 0) await new Promise(resolve => setTimeout(resolve, remaining));
+    if (state.pdfDoc !== doc) return;
+    try { await doc.cleanup(true); } catch (error) {
+        if (state.pdfDoc === doc) console.warn('PDF cache cleanup failed:', error);
+    }
+}
+
+function renderPdfPages(tabId, preserveScroll = false) {
     const state = pdfStates[tabId];
-    if (!state || !state.pdfDoc || tabId !== activeTabId) return;
-
-    // Safety net: never let an invalid scale through to PDF.js viewport math.
-    if (!state.scale || state.scale <= 0 || !Number.isFinite(state.scale)) {
-        state.scale = 1.0;
-        state.fitNeedsRecompute = state.fitMode;
-    }
-
-    const pagesContainer = document.getElementById('viewer-pages');
-    const viewerContainer = document.getElementById('viewer-container');
-
-    // Save current scroll ratio if we want to preserve it
-    let scrollRatioX = 0, scrollRatioY = 0;
-    if (preserveScroll && pagesContainer.scrollWidth > 0 && pagesContainer.scrollHeight > 0) {
-        scrollRatioX = viewerContainer.scrollLeft / pagesContainer.scrollWidth;
-        scrollRatioY = viewerContainer.scrollTop / pagesContainer.scrollHeight;
-    }
-
-    hideCommentPopup();
-
-    // Double-buffer: render new content offscreen first, then swap
-    const buffer = document.createDocumentFragment();
-    const tempHolder = document.createElement('div');
-    tempHolder.style.position = 'absolute';
-    tempHolder.style.visibility = 'hidden';
-    tempHolder.style.pointerEvents = 'none';
-    document.body.appendChild(tempHolder);
-
-    if (state.spreadMode) {
-        await renderSpreadView(tabId, tempHolder, state);
-    } else {
-        await renderSinglePage(tabId, tempHolder, state);
-    }
-
-    // Move rendered content to the buffer
-    while (tempHolder.firstChild) {
-        buffer.appendChild(tempHolder.firstChild);
-    }
-    document.body.removeChild(tempHolder);
-
-    // Atomic swap: clear and insert in one go
-    pagesContainer.innerHTML = '';
-    pagesContainer.classList.toggle('spread', state.spreadMode);
-    pagesContainer.classList.toggle('horizontal', state.scrollDir === 'horizontal');
-    pagesContainer.appendChild(buffer);
-
-    // UI controls
-    document.getElementById('page-input').value = state.currentPage;
-    document.getElementById('page-total').textContent = state.totalPages;
-    document.getElementById('zoom-level').textContent = Math.round(state.scale * 100) + '%';
-    updatePageNavigationState(state);
-
-    if (preserveScroll && pagesContainer.scrollWidth > 0 && pagesContainer.scrollHeight > 0) {
-        // Restore scroll position based on ratio
-        viewerContainer.scrollLeft = scrollRatioX * pagesContainer.scrollWidth;
-        viewerContainer.scrollTop = scrollRatioY * pagesContainer.scrollHeight;
-    } else if (state.pendingScrollY && pagesContainer.scrollHeight > 0) {
-        // Restore previously-saved scroll on first render after open
-        viewerContainer.scrollTop = state.pendingScrollY * pagesContainer.scrollHeight;
-        state.pendingScrollY = 0;
-    } else {
-        viewerContainer.scrollTop = 0;
-        viewerContainer.scrollLeft = 0;
-    }
-
-    updateThumbnailHighlight(tabId);
-    updateBookmarkButton();
-    updateProgressBar(tabId);
+    if (!state?.pdfDoc || !state.loaded || tabId !== activeTabId || document.visibilityState === 'hidden') return Promise.resolve();
+    cancelPdfRendering(state);
+    cancelThumbnailRendering(state);
+    state.needsRender = true;
+    const generation = state.renderGeneration;
+    const doc = state.pdfDoc;
+    const isCurrent = () => pdfStates[tabId] === state && state.pdfDoc === doc &&
+        state.renderGeneration === generation && activeTabId === tabId && document.visibilityState !== 'hidden';
+    return enqueuePdfWork(async () => {
+        if (!isCurrent()) return;
+        const pagesContainer = document.getElementById('viewer-pages');
+        const viewerContainer = document.getElementById('viewer-container');
+        let scrollRatioX = 0, scrollRatioY = 0;
+        const hasScrollSnapshot = preserveScroll && pagesContainer.dataset.tabId === tabId && pagesContainer.scrollHeight > 0;
+        if (hasScrollSnapshot) {
+            scrollRatioX = viewerContainer.scrollLeft / (pagesContainer.scrollWidth || 1);
+            scrollRatioY = viewerContainer.scrollTop / pagesContainer.scrollHeight;
+        }
+        const tempHolder = document.createElement('div');
+        tempHolder.className = 'pdf-render-buffer';
+        tempHolder.style.position = 'absolute';
+        tempHolder.style.visibility = 'hidden';
+        tempHolder.style.pointerEvents = 'none';
+        document.body.appendChild(tempHolder);
+        try {
+            if (state.fitNeedsRecompute) await ensureFitScale(state, isCurrent);
+            if (!isCurrent()) return;
+            if (!Number.isFinite(state.scale) || state.scale <= 0) state.scale = 1;
+            const frame = { ...state, scale: state.scale, nightMode };
+            const startPage = frame.spreadMode ? getSpreadAnchorPage(frame) : frame.currentPage;
+            const pageNums = [startPage];
+            if (frame.spreadMode && startPage !== 1 && startPage < frame.totalPages) pageNums.push(startPage + 1);
+            if (frame.spreadMode && isRightBoundSpread(frame)) pageNums.reverse();
+            let holder = tempHolder;
+            if (pageNums.length > 1) {
+                holder = document.createElement('div');
+                holder.className = 'spread-pair';
+                tempHolder.appendChild(holder);
+            }
+            for (const pageNum of pageNums) {
+                if (!isCurrent()) return;
+                await createRenderedPage(state, frame, pageNum, tabId, holder,
+                    Math.floor(PDF_VIEWER_FRAME_PIXELS / pageNums.length), isCurrent);
+            }
+            if (!isCurrent()) return;
+            hideCommentPopup();
+            releaseCanvasTree(pagesContainer);
+            pagesContainer.classList.toggle('spread', frame.spreadMode);
+            pagesContainer.classList.toggle('horizontal', frame.scrollDir === 'horizontal');
+            pagesContainer.dataset.tabId = tabId;
+            while (tempHolder.firstChild) pagesContainer.appendChild(tempHolder.firstChild);
+            state.needsRender = false;
+            document.getElementById('page-input').value = frame.currentPage;
+            document.getElementById('page-total').textContent = frame.totalPages;
+            updateViewerZoomSlider(state);
+            updateFitButtonState(state);
+            updatePageNavigationState(state);
+            if (hasScrollSnapshot && pagesContainer.scrollHeight > 0) {
+                viewerContainer.scrollLeft = scrollRatioX * pagesContainer.scrollWidth;
+                viewerContainer.scrollTop = scrollRatioY * pagesContainer.scrollHeight;
+            } else if (state.pendingScrollY && pagesContainer.scrollHeight > 0) {
+                viewerContainer.scrollTop = state.pendingScrollY * pagesContainer.scrollHeight;
+            } else {
+                viewerContainer.scrollTop = 0;
+                viewerContainer.scrollLeft = 0;
+            }
+            state.pendingScrollY = 0;
+            updateThumbnailHighlight(tabId);
+            updateBookmarkButton();
+            updateProgressBar(tabId);
+        } catch (error) {
+            if (isCurrent() && error.name !== 'RenderingCancelledException' && error.name !== 'AbortException') {
+                console.error('PDF render failed:', error);
+            }
+        } finally {
+            releaseCanvasTree(tempHolder);
+            tempHolder.remove();
+            await cleanupPdfDocument(state, doc);
+        }
+        if (isCurrent() && state.thumbnailsOpen) generateThumbnails(tabId);
+    });
 }
 
-async function renderSinglePage(tabId, container, state) {
-    const wrapper = await createRenderedPage(state, state.currentPage, tabId);
-    if (wrapper) container.appendChild(wrapper);
-}
-
-async function renderSpreadView(tabId, container, state) {
-    // Page 1 alone (cover), then 2-3, 4-5, etc. Visual order follows binding direction.
-    const startPage = getSpreadAnchorPage(state);
-    if (startPage === 1) {
-        const w = await createRenderedPage(state, 1, tabId);
-        if (w) container.appendChild(w);
-    } else {
-        const pair = document.createElement('div');
-        pair.className = 'spread-pair';
-        const pageNums = [startPage];
-        if (startPage + 1 <= state.totalPages) {
-            pageNums.push(startPage + 1);
-        }
-        if (isRightBoundSpread(state)) {
-            pageNums.reverse();
-        }
-        for (const pageNum of pageNums) {
-            const wrapper = await createRenderedPage(state, pageNum, tabId);
-            if (wrapper) pair.appendChild(wrapper);
-        }
-        container.appendChild(pair);
-    }
-}
-
-async function createRenderedPage(state, pageNum, tabId) {
+async function createRenderedPage(state, frame, pageNum, tabId, holder, maxPixels, isCurrent) {
+    const page = await frame.pdfDoc.getPage(pageNum);
+    let renderTask;
     try {
-        const page = await state.pdfDoc.getPage(pageNum);
-        const viewport = page.getViewport({ scale: state.scale });
-
+        if (!isCurrent()) return;
+        const viewport = page.getViewport({ scale: frame.scale });
         const wrapper = document.createElement('div');
         wrapper.className = 'page-wrapper';
         wrapper.style.width = viewport.width + 'px';
         wrapper.style.height = viewport.height + 'px';
+        wrapper.style.setProperty('--total-scale-factor', frame.scale);
+        wrapper.style.setProperty('--scale-round-x', '1px');
+        wrapper.style.setProperty('--scale-round-y', '1px');
         wrapper.dataset.page = pageNum;
-
+        holder.appendChild(wrapper);
         const canvas = document.createElement('canvas');
         canvas.className = 'page-canvas';
-        const ctx = canvas.getContext('2d');
-        const dpr = Math.min(window.devicePixelRatio || 1, 2);
-        canvas.width = viewport.width * dpr;
-        canvas.height = viewport.height * dpr;
+        const size = getPdfCanvasSize(viewport, maxPixels);
+        canvas.width = size.width;
+        canvas.height = size.height;
         canvas.style.width = viewport.width + 'px';
         canvas.style.height = viewport.height + 'px';
-        ctx.scale(dpr, dpr);
         wrapper.appendChild(canvas);
-
-        await page.render({ canvasContext: ctx, viewport }).promise;
-
-        if (nightMode) applyNightFilterToCanvas(canvas, ctx);
-
+        const ctx = canvas.getContext('2d');
+        renderTask = page.render({
+            canvasContext: ctx, viewport,
+            transform: [size.width / viewport.width, 0, 0, size.height / viewport.height, 0, 0],
+        });
+        state.renderTasks.add(renderTask);
+        await renderTask.promise;
+        state.renderTasks.delete(renderTask);
+        if (!isCurrent()) return;
+        if (frame.nightMode) applyNightFilterToCanvas(canvas, ctx);
+        await renderPageTextLayer(page, viewport, wrapper, state, isCurrent);
+        if (!isCurrent()) return;
         // Add comment markers for this page
         const pageComments = (state.comments || []).filter(c => c.pageNum === pageNum);
         for (const comment of pageComments) {
@@ -1100,10 +1305,74 @@ async function createRenderedPage(state, pageNum, tabId) {
             addNewComment(tabId, pageNum, x, y, e.clientX, e.clientY);
         });
 
-        return wrapper;
-    } catch (err) {
-        console.error('Render error page', pageNum, err);
+    } finally {
+        if (renderTask) state.renderTasks.delete(renderTask);
+        // Release operator lists and decoded page images, not just the DOM canvas.
+        page.cleanup();
+    }
+}
+
+async function readPageTextContent(page, state, isCurrent) {
+    // Some WKWebView versions have ReadableStream.getReader(), but no async
+    // iterator. PDF.js's getTextContent() uses for-await and leaks an unconsumed
+    // text stream on those versions. Consume it explicitly, with early bounds.
+    if (!page.streamTextContent) return page.getTextContent({ includeMarkedContent: true });
+    const reader = page.streamTextContent({ includeMarkedContent: true }).getReader();
+    (state.textReaders ||= new Set()).add(reader);
+    const textContent = { items: [], styles: Object.create(null), lang: null };
+    let characters = 0;
+    try {
+        while (isCurrent()) {
+            const { value, done } = await reader.read();
+            if (done) return textContent;
+            if (!isCurrent()) return null;
+            textContent.lang ??= value.lang;
+            Object.assign(textContent.styles, value.styles);
+            for (const item of value.items) {
+                if (typeof item.str === 'string') characters += item.str.length;
+                textContent.items.push(item);
+            }
+            if (textContent.items.length > MAX_TEXT_LAYER_ITEMS || characters > MAX_TEXT_LAYER_CHARS) return null;
+        }
         return null;
+    } finally {
+        state.textReaders.delete(reader);
+        // PDF.js's message stream requires an Error reason to mark its controller
+        // closed before late worker chunks arrive (a reasonless cancel asserts).
+        try { await reader.cancel(new Error('PDF text reader released')); } catch (_error) { /* worker may already be destroyed */ }
+        reader.releaseLock();
+    }
+}
+
+async function renderPageTextLayer(page, viewport, wrapper, state, isCurrent) {
+    if (!pdfjsLib?.TextLayer || !page?.getTextContent || !isCurrent()) return;
+    const textLayerDiv = document.createElement('div');
+    textLayerDiv.className = 'textLayer';
+    textLayerDiv.setAttribute('aria-hidden', 'true');
+    wrapper.appendChild(textLayerDiv);
+    let textLayer;
+    try {
+        const textContent = await readPageTextContent(page, state, isCurrent);
+        if (!textContent || !isCurrent()) {
+            textLayerDiv.remove();
+            return;
+        }
+        const textItems = (textContent.items || []).filter(item => typeof item.str === 'string');
+        const charCount = textItems.reduce((sum, item) => sum + item.str.length, 0);
+        if (!isCurrent() || !wrapper.isConnected || textItems.length === 0 ||
+            textItems.length > MAX_TEXT_LAYER_ITEMS || charCount > MAX_TEXT_LAYER_CHARS) {
+            textLayerDiv.remove();
+            return;
+        }
+        textLayer = new pdfjsLib.TextLayer({ textContentSource: textContent, container: textLayerDiv, viewport });
+        state.textLayers.add(textLayer);
+        await textLayer.render();
+        if (!isCurrent() || !textLayerDiv.textContent.trim()) textLayerDiv.remove();
+    } catch (error) {
+        textLayerDiv.remove();
+        if (isCurrent() && error.name !== 'AbortException') console.warn('Text layer render failed:', error);
+    } finally {
+        if (textLayer) state.textLayers.delete(textLayer);
     }
 }
 
@@ -1227,8 +1496,6 @@ async function viewerFitCycle() {
         return; // Don't re-render, just release fit mode
     }
 
-    await ensureFitScale(state);
-    updateViewerZoomSlider(state);
     updateFitButtonState(state);
     renderPdfPages(activeTabId);
     scheduleSaveBookState(activeTabId);
@@ -1241,21 +1508,9 @@ function toggleSpreadMode() {
     document.getElementById('btn-spread').classList.toggle('active', state.spreadMode);
     updateSpreadDirectionButtonState(state);
     updatePageNavigationState(state);
-    if (state.fitMode) {
-        const tabId = activeTabId;
-        state.fitNeedsRecompute = true;
-        ensureFitScale(state).then(() => {
-            if (activeTabId !== tabId || pdfStates[tabId] !== state) return;
-            updateViewerZoomSlider(state);
-            updateFitButtonState(state);
-            renderPdfPages(tabId);
-            saveBookState(tabId);
-        });
-    }
-    else {
-        renderPdfPages(activeTabId);
-        saveBookState(activeTabId);
-    }
+    if (state.fitMode) state.fitNeedsRecompute = true;
+    renderPdfPages(activeTabId);
+    saveBookState(activeTabId);
 }
 
 function toggleSpreadDirection() {
@@ -1291,44 +1546,83 @@ function viewerToggleThumbnails() {
     if (state.thumbnailsOpen) {
         generateThumbnails(activeTabId);
     } else {
-        document.getElementById('thumbnail-list').innerHTML = '';
+        cancelThumbnailRendering(state, true);
     }
 }
 
-async function generateThumbnails(tabId) {
+function generateThumbnails(tabId) {
     const state = pdfStates[tabId];
-    if (!state || !state.pdfDoc) return;
-    const list = document.getElementById('thumbnail-list');
-    list.innerHTML = '';
-    const max = Math.min(state.totalPages, 80);
-    for (let i = 1; i <= max; i++) {
-        const item = document.createElement('div');
-        item.className = 'thumbnail-item' + (i === state.currentPage ? ' active' : '');
-        item.dataset.page = i;
-        const canvas = document.createElement('canvas');
-        canvas.className = 'thumbnail-canvas';
-        const label = document.createElement('span');
-        label.className = 'thumbnail-label';
-        label.textContent = i;
-        item.appendChild(canvas);
-        item.appendChild(label);
-        list.appendChild(item);
-        item.addEventListener('click', () => { state.currentPage = i; renderPdfPages(tabId); saveBookState(tabId); });
-    }
-    for (let i = 1; i <= max; i++) {
-        const canvas = list.children[i - 1]?.querySelector('canvas');
-        if (!canvas) continue;
-        try {
-            const page = await state.pdfDoc.getPage(i);
-            const vp = page.getViewport({ scale: 0.2 });
-            const dpr = 1;
-            canvas.width = vp.width * dpr; canvas.height = vp.height * dpr;
-            canvas.style.width = vp.width + 'px'; canvas.style.height = vp.height + 'px';
-            const ctx = canvas.getContext('2d'); ctx.scale(dpr, dpr);
-            await page.render({ canvasContext: ctx, viewport: vp }).promise;
-            if (nightMode) applyNightFilterToCanvas(canvas, ctx);
-        } catch (e) { /* skip */ }
-    }
+    if (!state?.pdfDoc || !state.thumbnailsOpen || activeTabId !== tabId) return Promise.resolve();
+    cancelThumbnailRendering(state);
+    const generation = state.thumbnailGeneration;
+    const doc = state.pdfDoc;
+    const theme = nightMode;
+    const isCurrent = () => pdfStates[tabId] === state && state.pdfDoc === doc &&
+        state.thumbnailGeneration === generation && state.thumbnailsOpen && activeTabId === tabId &&
+        document.visibilityState !== 'hidden';
+    return enqueuePdfWork(async () => {
+        if (!isCurrent()) return;
+        const list = document.getElementById('thumbnail-list');
+        const max = Math.min(state.totalPages, 80);
+        if (list.dataset.tabId !== tabId || list.dataset.theme !== String(theme)) {
+            releaseCanvasTree(list);
+            list.dataset.tabId = tabId;
+            list.dataset.theme = String(theme);
+            for (let i = 1; i <= max; i++) {
+                const item = document.createElement('div');
+                item.className = 'thumbnail-item' + (i === state.currentPage ? ' active' : '');
+                item.dataset.page = i;
+                const canvas = document.createElement('canvas');
+                canvas.className = 'thumbnail-canvas';
+                canvas.width = canvas.height = 0;
+                const label = document.createElement('span');
+                label.className = 'thumbnail-label';
+                label.textContent = i;
+                item.appendChild(canvas);
+                item.appendChild(label);
+                list.appendChild(item);
+                item.addEventListener('click', () => {
+                    if (activeTabId !== tabId || pdfStates[tabId] !== state) return;
+                    state.currentPage = i;
+                    renderPdfPages(tabId);
+                    saveBookState(tabId);
+                });
+            }
+        }
+        for (let i = 1; i <= max && isCurrent(); i++) {
+            const canvas = list.children[i - 1]?.querySelector('canvas');
+            if (!canvas || canvas.dataset.rendered === 'true') continue;
+            let page, task;
+            try {
+                page = await doc.getPage(i);
+                if (!isCurrent()) return;
+                const original = page.getViewport({ scale: 1 });
+                const scale = Math.min(0.2, 120 / original.width, 180 / original.height);
+                const viewport = page.getViewport({ scale });
+                const size = getPdfCanvasSize(viewport, 120 * 180, 1);
+                canvas.width = size.width;
+                canvas.height = size.height;
+                canvas.style.width = viewport.width + 'px';
+                canvas.style.height = viewport.height + 'px';
+                const ctx = canvas.getContext('2d');
+                task = page.render({ canvasContext: ctx, viewport,
+                    transform: [size.width / viewport.width, 0, 0, size.height / viewport.height, 0, 0] });
+                state.thumbnailTask = task;
+                await task.promise;
+                if (!isCurrent()) return;
+                if (theme) applyNightFilterToCanvas(canvas, ctx);
+                canvas.dataset.rendered = 'true';
+            } catch (error) {
+                if (isCurrent() && error.name !== 'RenderingCancelledException') console.warn('Thumbnail failed:', error);
+            } finally {
+                if (state.thumbnailTask === task) state.thumbnailTask = null;
+                if (canvas.dataset.rendered !== 'true') canvas.width = canvas.height = 0;
+                page?.cleanup();
+                // Shared image objects can be much larger than these tiny thumbnails.
+                await cleanupPdfDocument(state, doc);
+            }
+        }
+    });
 }
 
 function updateThumbnailHighlight(tabId) {
@@ -1346,6 +1640,7 @@ function updateThumbnailHighlight(tabId) {
 // ══════════════════════════════════════════════════════
 
 async function renderBooks() {
+    const requestId = ++renderBooksRequestId;
     const grid = document.getElementById('book-grid');
     const emptyState = document.getElementById('empty-state');
     const countEl = document.getElementById('book-count');
@@ -1371,7 +1666,14 @@ async function renderBooks() {
     // Search (NFKC normalize + lowercase + strip whitespace)
     const rawQuery = document.getElementById('search-input').value;
     const query = normalizeForSearch(rawQuery);
-    if (query) books = books.filter(b => normalizeForSearch(b.title).includes(query));
+    if (query) {
+        const pdfContentPaths = await getPdfContentSearchPathSet(rawQuery);
+        if (requestId !== renderBooksRequestId) return;
+        books = books.filter(b =>
+            normalizeForSearch(b.title).includes(query) ||
+            pdfContentPaths.has(normalizePathForSearch(b.filePath))
+        );
+    }
 
     // Sort (skip for recent-opened which has its own sort)
     if (currentFilter !== 'recent-opened') {
@@ -1402,6 +1704,30 @@ async function renderBooks() {
 
 function shouldUseBookFolderGrid(query) {
     return viewMode === 'grid' && currentFilter === 'all' && !query;
+}
+
+async function getPdfContentSearchPathSet(rawQuery) {
+    const trimmed = String(rawQuery || '').trim();
+    const normalized = normalizeForSearch(trimmed);
+    if (normalized.length < PDF_CONTENT_SEARCH_MIN_CHARS) return new Set();
+
+    const cacheKey = trimmed.normalize('NFKC').toLowerCase();
+    const cached = pdfContentSearchCache.get(cacheKey);
+    if (cached) return cached;
+
+    try {
+        const paths = await invoke('search_pdf_content_paths', { query: trimmed });
+        const result = new Set((paths || []).map(normalizePathForSearch));
+        pdfContentSearchCache.set(cacheKey, result);
+        return result;
+    } catch (err) {
+        console.warn('PDF content search failed:', err);
+        return new Set();
+    }
+}
+
+function normalizePathForSearch(path) {
+    return String(path || '').normalize('NFC').toLowerCase();
 }
 
 function buildBookFolderModel(books) {
@@ -2522,41 +2848,25 @@ function setupEventListeners() {
         }
     });
 
-    let isClosingWindow = false;
-    if (getCurrentWebviewWindow()?.onCloseRequested) {
-        getCurrentWebviewWindow().onCloseRequested(async (event) => {
-            if (isClosingWindow) return;
-            event.preventDefault();
-            isClosingWindow = true;
-
-            const appWindow = getCurrentWebviewWindow();
-            try {
-                await flushOpenPdfState();
-            } finally {
-                try {
-                    if (await appWindow.isFullscreen?.()) {
-                        await appWindow.setFullscreen(false);
-                    }
-                } catch (_e) { /* best-effort before closing */ }
-
-                try {
-                    await invoke('quit_app');
-                } catch (_e) {
-                    if (appWindow.destroy) {
-                        await appWindow.destroy();
-                    } else {
-                        await appWindow.close();
-                    }
-                }
-            }
-        });
-    }
+    // Rust owns both Cmd+Q and the window close button. Do not intercept
+    // CloseRequested in JavaScript: it cannot acknowledge a dead WebView.
+    listen('app-quit-requested', () => {
+        prepareAppQuit().catch(error => console.warn('Failed to finish app quit:', error));
+    });
 
     window.addEventListener('pageshow', () => scheduleResumeRecovery('pageshow'));
     window.addEventListener('focus', () => scheduleResumeRecovery('focus'));
+    window.addEventListener('blur', () => schedulePdfBackgroundRelease(PDF_INACTIVE_EVICT_MS));
     window.addEventListener('paperstock-system-resumed', () => scheduleResumeRecovery('paperstock-system-resumed'));
     document.addEventListener('visibilitychange', () => {
         if (document.visibilityState === 'visible') scheduleResumeRecovery('visibilitychange');
+        else {
+            for (const state of Object.values(pdfStates)) {
+                cancelPdfRendering(state);
+                cancelThumbnailRendering(state);
+            }
+            schedulePdfBackgroundRelease();
+        }
     });
 
     // Comment popup
@@ -2620,12 +2930,7 @@ function setupEventListeners() {
             if (state && state.fitMode && state.loaded) {
                 const tabId = activeTabId;
                 state.fitNeedsRecompute = true;
-                ensureFitScale(state).then(() => {
-                    if (activeTabId !== tabId || pdfStates[tabId] !== state) return;
-                    updateViewerZoomSlider(state);
-                    updateFitButtonState(state);
-                    renderPdfPages(tabId, true);
-                });
+                renderPdfPages(tabId, true);
             }
         }, 200);
     });
@@ -2647,6 +2952,7 @@ async function importFiles(filePaths) {
         try { await invoke('import_pdf', { filePath: filePaths[i] }); } catch (e) { console.error('Import failed:', filePaths[i], e); }
     }
     overlay.remove();
+    pdfContentSearchCache.clear();
     await loadData(); renderBooks();
 }
 
