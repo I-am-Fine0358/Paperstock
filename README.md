@@ -23,13 +23,14 @@ macOSで動作するPDF管理・閲覧アプリ。本棚のようにPDFを整理
 ```bash
 git clone https://github.com/YOUR_USERNAME/Paperstock.git
 cd Paperstock
+cd paperstock-tauri
 npm install
 ```
 
 ## 🚀 起動
 
 ```bash
-npm start
+npm run dev
 ```
 
 ## 📦 アプリビルド（.dmg）
@@ -38,33 +39,25 @@ npm start
 npm run build
 ```
 
-`dist/` フォルダにインストーラ（`.dmg`）が生成されます。
+`src-tauri/target/release/bundle/` 以下にアプリまたはインストーラが生成されます。
 
 ## 🛠 技術スタック
 
 | 技術 | 用途 |
 |------|------|
-| [Electron](https://www.electronjs.org/) | デスクトップアプリフレームワーク |
+| [Tauri](https://tauri.app/) | デスクトップアプリフレームワーク |
 | [PDF.js](https://mozilla.github.io/pdf.js/) | PDFレンダリング |
-| [better-sqlite3](https://github.com/WiseLibs/better-sqlite3) | ブックメタデータ・コメント保存 |
+| [rusqlite](https://github.com/rusqlite/rusqlite) | ブックメタデータ・コメント保存 |
 | Vanilla JS + CSS | UI（フレームワーク不使用） |
 
 ## 📁 ファイル構成
 
 ```
 Paperstock/
-├── main.js            # Electronメインプロセス
-├── preload.js         # コンテキストブリッジ
-├── lib/
-│   ├── database.js    # SQLite DB操作
-│   └── pdf-utils.js   # PDF表紙抽出・ページ数取得
-├── src/
-│   ├── index.html     # メインUI
-│   ├── css/
-│   │   └── index.css  # スタイル
-│   └── js/
-│       └── bookshelf.js # アプリロジック
-├── package.json
+├── paperstock-tauri/
+│   ├── src/           # HTML/CSS/JS frontend
+│   ├── src-tauri/     # Rust backend / Tauri config
+│   └── package.json
 ├── LICENSE
 └── README.md
 ```

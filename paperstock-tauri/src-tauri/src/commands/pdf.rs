@@ -1,12 +1,13 @@
 use std::path::Path;
 
 use base64::Engine;
-use tauri::ipc::Response;
+use tauri::State;
+
+use crate::pdf_server::PdfServer;
 
 #[tauri::command]
-pub fn read_pdf_file(file_path: String) -> Result<Response, String> {
-    let data = std::fs::read(&file_path).map_err(|e| e.to_string())?;
-    Ok(Response::new(data))
+pub fn get_pdf_stream_url(server: State<PdfServer>, file_path: String) -> Result<String, String> {
+    server.register(file_path)
 }
 
 #[tauri::command]

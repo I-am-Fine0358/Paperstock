@@ -1,6 +1,9 @@
-use tauri::menu::{MenuBuilder, SubmenuBuilder, MenuItemBuilder, PredefinedMenuItem};
+use tauri::menu::{MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder};
 
 pub fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tauri::Wry>> {
+    let quit = MenuItemBuilder::with_id("quit-app", "Paperstockを終了")
+        .accelerator("CmdOrCtrl+Q")
+        .build(app)?;
     // App menu (Paperstock)
     let app_menu = SubmenuBuilder::new(app, "Paperstock")
         .about(None)
@@ -9,7 +12,7 @@ pub fn build_menu(app: &tauri::AppHandle) -> tauri::Result<tauri::menu::Menu<tau
         .hide_others()
         .show_all()
         .separator()
-        .quit()
+        .item(&quit)
         .build()?;
 
     // ファイル menu

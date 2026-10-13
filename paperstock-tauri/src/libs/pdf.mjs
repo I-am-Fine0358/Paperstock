@@ -20129,7 +20129,10 @@ class PDFFetchStreamReader extends BasePDFStreamReader {
     };
   }
   cancel(reason) {
-    this._reader?.cancel(reason);
+    // Paperstock: cancellation can precede the first headers/body read. Claim
+    // the rejection without changing the promise observed by later readers.
+    this._headersCapability.promise.catch(() => {});
+    this._reader?.cancel(reason).catch(() => {});
     this._abortController.abort();
   }
 }
@@ -20171,7 +20174,9 @@ class PDFFetchStreamRangeReader extends BasePDFStreamRangeReader {
     };
   }
   cancel(reason) {
-    this._reader?.cancel(reason);
+    // See PAPERSTOCK_PATCHES.md: only intentional cleanup consumes this error.
+    this._readCapability.promise.catch(() => {});
+    this._reader?.cancel(reason).catch(() => {});
     this._abortController.abort();
   }
 }
@@ -22282,6 +22287,10 @@ class WorkerTransport {
     if (this.hasOwnProperty("annotationStorage")) {
       this.annotationStorage.resetModified();
     }
+    // Paperstock: network readers live on the main thread. Abort them before
+    // waiting for the worker, which may itself be waiting for a network read.
+    // See PAPERSTOCK_PATCHES.md before updating this bundled dependency.
+    this.#networkStream?.cancelAllRequests(new AbortException("Worker was terminated."));
     const terminated = this.messageHandler.sendWithPromise("Terminate", null);
     waitOn.push(terminated);
     Promise.all(waitOn).then(() => {
@@ -22290,7 +22299,6 @@ class WorkerTransport {
       this.#methodPromises.clear();
       this.filterFactory.destroy();
       TextLayer.cleanup();
-      this.#networkStream?.cancelAllRequests(new AbortException("Worker was terminated."));
       this.messageHandler?.destroy();
       this.messageHandler = null;
       this.destroyCapability.resolve();

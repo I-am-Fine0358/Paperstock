@@ -3,6 +3,10 @@ node_modules/
 
 # Build output
 dist/
+paperstock-tauri/src-tauri/target/
+
+# Local diagnostics, generated fixtures, and private reproduction data
+/tmp/
 
 # Database
 *.db

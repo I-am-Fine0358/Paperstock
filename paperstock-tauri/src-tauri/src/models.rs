@@ -12,6 +12,10 @@ pub struct Book {
     pub favorite: i64,
     pub last_opened_at: Option<String>,
     pub last_page: i64,
+    pub last_scroll_y: f64,
+    pub last_zoom: f64,
+    pub last_spread_mode: i64,
+    pub last_spread_direction: i64,
     pub created_at: String,
     pub updated_at: String,
     pub tags: Vec<Tag>,
@@ -60,6 +64,10 @@ pub struct BookUpdate {
     pub favorite: Option<i64>,
     pub last_opened_at: Option<String>,
     pub last_page: Option<i64>,
+    pub last_scroll_y: Option<f64>,
+    pub last_zoom: Option<f64>,
+    pub last_spread_mode: Option<i64>,
+    pub last_spread_direction: Option<i64>,
 }
 
 impl Default for BookUpdate {
@@ -72,6 +80,10 @@ impl Default for BookUpdate {
             favorite: None,
             last_opened_at: None,
             last_page: None,
+            last_scroll_y: None,
+            last_zoom: None,
+            last_spread_mode: None,
+            last_spread_direction: None,
         }
     }
 }

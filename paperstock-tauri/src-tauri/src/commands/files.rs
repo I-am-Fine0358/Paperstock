@@ -6,20 +6,19 @@ use tauri_plugin_dialog::DialogExt;
 use crate::db::BookDatabase;
 use crate::models::{Book, BookUpdate};
 
+fn book_path_matches(book: &Book, path: &Path) -> bool {
+    let book_path = Path::new(&book.file_path);
+    crate::pdf_utils::paths_equivalent(book_path, path)
+}
+
 /// Return the managed pdfs directory: ~/Library/Application Support/Paperstock/pdfs
 fn pdfs_dir() -> PathBuf {
-    dirs::data_dir()
-        .unwrap()
-        .join("Paperstock")
-        .join("pdfs")
+    crate::data_paths::user_data_dir().join("pdfs")
 }
 
 /// Return the managed covers directory: ~/Library/Application Support/Paperstock/covers
 fn covers_dir() -> PathBuf {
-    dirs::data_dir()
-        .unwrap()
-        .join("Paperstock")
-        .join("covers")
+    crate::data_paths::user_data_dir().join("covers")
 }
 
 #[tauri::command]
@@ -73,15 +72,51 @@ pub async fn import_pdf(
     std::fs::create_dir_all(&covers_dir).map_err(|e| e.to_string())?;
 
     let source = Path::new(&file_path);
+    let source_path = source.canonicalize().map_err(|e| e.to_string())?;
     let basename = source
         .file_name()
         .ok_or_else(|| "Invalid file path".to_string())?;
 
+    let books = db.get_all_books();
+
+    if crate::pdf_utils::path_is_inside_dir(&source_path, &pdfs_dir) {
+        if let Some(book) = books.iter().find(|b| book_path_matches(b, &source_path)) {
+            return Ok(Some(book.clone()));
+        }
+
+        let source_str = source_path.to_string_lossy().to_string();
+        let title = source_path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let page_count = crate::pdf_utils::get_page_count(&source_str);
+        let book = db.add_book(&title, &source_str, None, page_count);
+        let cover_path = crate::pdf_utils::extract_cover(
+            &source_str,
+            covers_dir.to_str().unwrap_or(""),
+            book.id,
+        );
+        let book = if let Some(ref cp) = cover_path {
+            let updates = BookUpdate {
+                cover_path: Some(cp.clone()),
+                ..Default::default()
+            };
+            db.update_book(book.id, &updates).unwrap_or(book)
+        } else {
+            book
+        };
+
+        return Ok(Some(book));
+    }
+
     let mut dest_path = pdfs_dir.join(basename);
 
     // Check if a book with the same dest_path already exists in DB
-    let dest_str = dest_path.to_string_lossy().to_string();
-    let existing = db.get_all_books().into_iter().find(|b| b.file_path == dest_str);
+    let existing = books
+        .iter()
+        .find(|b| book_path_matches(b, &dest_path))
+        .cloned();
     if let Some(book) = existing {
         return Ok(Some(book));
     }
@@ -96,7 +131,10 @@ pub async fn import_pdf(
                 basename.to_string_lossy()
             ))
             .title("ファイルの重複")
-            .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom("別名で保存".to_string(), "スキップ".to_string()))
+            .buttons(tauri_plugin_dialog::MessageDialogButtons::OkCancelCustom(
+                "別名で保存".to_string(),
+                "スキップ".to_string(),
+            ))
             .show(move |confirmed| {
                 let _ = tx.send(confirmed);
             });
@@ -146,7 +184,8 @@ pub async fn import_pdf(
     let book = db.add_book(&title, &dest_str, None, page_count);
 
     // Extract cover image
-    let cover_path = crate::pdf_utils::extract_cover(&dest_str, covers_dir.to_str().unwrap_or(""), book.id);
+    let cover_path =
+        crate::pdf_utils::extract_cover(&dest_str, covers_dir.to_str().unwrap_or(""), book.id);
 
     // Update book with cover_path if extraction succeeded
     let book = if let Some(ref cp) = cover_path {
@@ -163,11 +202,7 @@ pub async fn import_pdf(
 }
 
 #[tauri::command]
-pub fn set_custom_cover(
-    db: State<BookDatabase>,
-    book_id: i64,
-    image_path: String,
-) -> Option<Book> {
+pub fn set_custom_cover(db: State<BookDatabase>, book_id: i64, image_path: String) -> Option<Book> {
     let covers_dir = covers_dir();
     let _ = std::fs::create_dir_all(&covers_dir);
 
