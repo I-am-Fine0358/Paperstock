@@ -58,11 +58,101 @@ const PDF_INACTIVE_EVICT_MS = 60000;
 const PDF_HIDDEN_RELEASE_MS = 15000;
 const PDF_VIEWER_FRAME_PIXELS = 8 * 1024 * 1024;
 const PDF_CANVAS_MAX_DIMENSION = 4096;
+const PDF_LOAD_IDLE_TIMEOUT_MS = 60000;
+const PDF_WORKER_RELEASE_TIMEOUT_MS = 3000;
 let pdfWorkTail = Promise.resolve();
 let pdfBackgroundTimer = null;
 let pdfBackgroundDeadline = 0;
 let pdfLastUsedOrder = 0;
 const pdfPendingDestructions = new Set();
+
+function pdfCancelledError() {
+    const error = new Error('PDF operation cancelled');
+    error.name = 'AbortError';
+    return error;
+}
+
+// Race every cross-worker wait with the document's lifetime. Terminating a
+// Worker does not settle its outstanding JavaScript promises on its own.
+function waitForPdfPromise(promise, { signal, timeoutMs = 0, watch = null } = {}) {
+    return new Promise((resolve, reject) => {
+        let settled = false, timer = null;
+        let deadline = Date.now() + timeoutMs;
+        const finish = (callback, value) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            signal?.removeEventListener('abort', onAbort);
+            if (watch?.checkDeadline === checkDeadline) {
+                watch.checkDeadline = null;
+                watch.touchProgress = null;
+            }
+            callback(value);
+        };
+        const onAbort = () => finish(reject, signal.reason || pdfCancelledError());
+        const checkDeadline = () => {
+            if (settled || !timeoutMs) return;
+            if (Date.now() >= deadline) {
+                const error = new Error('PDF operation timed out');
+                error.name = 'TimeoutError';
+                finish(reject, error);
+            } else {
+                clearTimeout(timer);
+                timer = setTimeout(checkDeadline, deadline - Date.now());
+            }
+        };
+        // Install handlers even for an already-aborted request, so late worker
+        // rejections cannot become unhandled or modify a newer attempt.
+        Promise.resolve(promise).then(value => finish(resolve, value), error => finish(reject, error));
+        if (signal?.aborted) { onAbort(); return; }
+        signal?.addEventListener('abort', onAbort, { once: true });
+        if (timeoutMs) timer = setTimeout(checkDeadline, timeoutMs);
+        if (watch) {
+            watch.checkDeadline = checkDeadline;
+            watch.touchProgress = () => {
+                if (settled) return;
+                deadline = Date.now() + timeoutMs;
+                checkDeadline();
+            };
+        }
+    });
+}
+
+function waitForPdfSession(promise, runtime) {
+    return waitForPdfPromise(promise, { signal: runtime?.controller.signal });
+}
+
+function createPdfRuntime(attempt, onWorkerFailure) {
+    // Own the actual Worker as well as PDF.js's public wrapper. The wrapper's
+    // destroy() alone cannot terminate a worker that is still initializing.
+    const port = new Worker(pdfjsLib.GlobalWorkerOptions.workerSrc, { type: 'module' });
+    const runtime = { port, worker: null, controller: attempt.controller, stopped: false };
+    const onFailure = () => {
+        const error = new Error('PDF worker failed');
+        attempt.controller.abort(error);
+        onWorkerFailure?.(error);
+    };
+    runtime.onFailure = onFailure;
+    port.addEventListener('error', onFailure);
+    port.addEventListener('messageerror', onFailure);
+    try {
+        runtime.worker = pdfjsLib.PDFWorker.create({ port });
+        return runtime;
+    } catch (error) {
+        stopPdfRuntime(runtime);
+        throw error;
+    }
+}
+
+function stopPdfRuntime(runtime) {
+    if (!runtime || runtime.stopped) return;
+    runtime.stopped = true;
+    runtime.port.removeEventListener('error', runtime.onFailure);
+    runtime.port.removeEventListener('messageerror', runtime.onFailure);
+    // Native terminate is synchronous and requires no reply from the worker.
+    runtime.port.terminate();
+    try { runtime.worker?.destroy(); } catch (error) { console.warn('PDF worker wrapper cleanup failed:', error); }
+}
 
 function enqueuePdfWork(work) {
     const pending = pdfWorkTail.then(work);
@@ -112,6 +202,7 @@ function rememberPdfScroll(state) {
 }
 
 function releasePdfDocument(state) {
+    state.loadAttempt?.controller.abort(pdfCancelledError());
     if (state.releasePromise) {
         // A tab can be reopened while destruction is pending, then hidden again.
         // Invalidate that waiting load as well instead of letting it revive in the background.
@@ -129,8 +220,10 @@ function releasePdfDocument(state) {
     cancelThumbnailRendering(state, true);
     const loadingTask = state.loadingTask;
     const doc = state.pdfDoc;
+    const runtime = state.pdfRuntime;
     state.pdfDoc = null;
     state.loadingTask = null;
+    state.pdfRuntime = null;
     state.loaded = false;
     state.loading = false;
     const pages = document.getElementById('viewer-pages');
@@ -139,9 +232,15 @@ function releasePdfDocument(state) {
         delete pages.dataset.tabId;
     }
     // destroy() also aborts network requests and terminates this document's worker.
-    const releasePromise = Promise.resolve().then(() => loadingTask ? loadingTask.destroy() : doc?.destroy())
+    const releasePromise = Promise.resolve().then(() => waitForPdfPromise(
+        loadingTask ? loadingTask.destroy() : doc?.destroy(),
+        { timeoutMs: PDF_WORKER_RELEASE_TIMEOUT_MS },
+    ))
         .catch(error => console.warn('PDF release failed:', error))
         .finally(() => {
+            // A broken Terminate handshake must not block every other tab. Only
+            // release the budget after the owned native worker is terminated.
+            stopPdfRuntime(runtime);
             pdfPendingDestructions.delete(releasePromise);
             if (state.releasePromise === releasePromise) state.releasePromise = null;
         });
@@ -370,32 +469,44 @@ function restoreTabState() {
 async function initPdfJs() {
     if (pdfjsReady) return;
     if (pdfjsInitPromise) return pdfjsInitPromise;
-    pdfjsInitPromise = initializePdfJs().finally(() => { pdfjsInitPromise = null; });
+    const controller = new AbortController();
+    pdfjsInitPromise = waitForPdfPromise(initializePdfJs(controller.signal), {
+        signal: controller.signal, timeoutMs: PDF_LOAD_IDLE_TIMEOUT_MS,
+    }).catch(error => {
+        console.error('Failed to initialize PDF.js:', error);
+        pdfjsInitError = String(error.message || error);
+    }).finally(() => {
+        controller.abort();
+        pdfjsInitPromise = null;
+    });
     return pdfjsInitPromise;
 }
 
-async function initializePdfJs() {
+async function initializePdfJs(signal) {
+    let blobUrl;
     try {
         // Tauri serves .mjs with wrong MIME type, so use fetch + blob URL workaround
-        const resp = await fetch('./libs/pdf.mjs');
+        const resp = await fetch('./libs/pdf.mjs', { signal });
+        if (!resp.ok) throw new Error('PDF.js module could not be loaded');
         const code = await resp.text();
         const blob = new Blob([code], { type: 'application/javascript' });
-        const blobUrl = URL.createObjectURL(blob);
+        blobUrl = URL.createObjectURL(blob);
         const module = await import(blobUrl);
-        URL.revokeObjectURL(blobUrl);
-        pdfjsLib = module;
+        if (signal.aborted) return;
 
         // Worker also needs blob URL workaround
-        const wResp = await fetch('./libs/pdf.worker.mjs');
+        const wResp = await fetch('./libs/pdf.worker.mjs', { signal });
+        if (!wResp.ok) throw new Error('PDF.js worker module could not be loaded');
         const wCode = await wResp.text();
+        if (signal.aborted) return;
         const wBlob = new Blob([wCode], { type: 'application/javascript' });
         const wBlobUrl = URL.createObjectURL(wBlob);
-        pdfjsLib.GlobalWorkerOptions.workerSrc = wBlobUrl;
+        module.GlobalWorkerOptions.workerSrc = wBlobUrl;
+        pdfjsLib = module;
 
         pdfjsReady = true;
-    } catch (e) {
-        console.error('Failed to initialize PDF.js:', e);
-        pdfjsInitError = String(e.message || e);
+    } finally {
+        if (blobUrl) URL.revokeObjectURL(blobUrl);
     }
 }
 let pdfjsInitError = '';
@@ -786,6 +897,7 @@ function scheduleResumeRecovery(reason = 'resume') {
         }
         const tabId = activeTabId;
         const state = pdfStates[tabId];
+        state?.loadAttempt?.checkDeadline?.();
         const forceRender = resumeNeedsRender;
         resumeNeedsRender = false;
         if (!state?.loaded) {
@@ -1004,7 +1116,7 @@ async function ensureFitScale(state, isCurrent = () => true) {
     }
     try {
         const pageNum = Math.max(1, Math.min(state.currentPage || 1, state.totalPages || state.currentPage || 1));
-        const page = await state.pdfDoc.getPage(pageNum);
+        const page = await waitForPdfSession(state.pdfDoc.getPage(pageNum), state.pdfRuntime);
         if (!isCurrent()) return;
         const viewport = page.getViewport({ scale: 1.0 });
         const fitType = getFitType(state);
@@ -1032,6 +1144,29 @@ async function ensureFitScale(state, isCurrent = () => true) {
     } catch (_e) {
         state.fitNeedsRecompute = true;
     }
+}
+
+function showPdfLoadFailure(tabId, state, error) {
+    state.loadError = error.name === 'TimeoutError'
+        ? 'PDFの読み込みが時間内に完了しませんでした。再試行してください。'
+        : 'PDFを開けませんでした。再試行してください。';
+    if (activeTabId !== tabId || pdfStates[tabId] !== state) return;
+    const loading = document.getElementById('viewer-loading');
+    loading.style.display = 'flex';
+    loading.replaceChildren();
+    const paragraph = document.createElement('p');
+    paragraph.textContent = state.loadError;
+    const retry = document.createElement('button');
+    retry.type = 'button';
+    retry.className = 'btn btn-primary';
+    retry.textContent = '再試行';
+    retry.addEventListener('click', () => {
+        if (pdfStates[tabId] !== state || state.closed) return;
+        const book = allBooks.find(item => item.id === state.bookId);
+        if (book) loadPdfForTab(tabId, book);
+    });
+    loading.appendChild(paragraph);
+    loading.appendChild(retry);
 }
 
 async function loadPdfForTab(tabId, book) {
@@ -1067,9 +1202,18 @@ async function loadPdfForTab(tabId, book) {
         };
     }
     state.loading = true;
+    state.loadError = null;
     state.lastUsedOrder = ++pdfLastUsedOrder;
     const generation = state.loadGeneration = (state.loadGeneration || 0) + 1;
+    const attempt = { controller: new AbortController(), phase: 'prepare', checkDeadline: null };
+    state.loadAttempt = attempt;
     const isCurrent = () => pdfStates[tabId] === state && !state.closed && state.loadGeneration === generation;
+    const wait = (promise, phase) => {
+        attempt.phase = phase;
+        return waitForPdfPromise(promise, {
+            signal: attempt.controller.signal, timeoutMs: PDF_LOAD_IDLE_TIMEOUT_MS, watch: attempt,
+        });
+    };
     const showStep = (message) => {
         if (!isCurrent() || activeTabId !== tabId) return;
         const loading = document.getElementById('viewer-loading');
@@ -1080,37 +1224,50 @@ async function loadPdfForTab(tabId, book) {
         loading.appendChild(paragraph);
     };
     try {
-        await state.releasePromise;
+        showStep('PDFを準備しています…');
+        await wait(state.releasePromise, 'release');
         if (!isCurrent()) return;
-        await enforcePdfDocumentLimit(tabId);
+        await wait(enforcePdfDocumentLimit(tabId), 'release');
         if (!isCurrent()) return;
         showStep('PDF.js初期化中…');
-        await initPdfJs();
+        await wait(initPdfJs(), 'initialize');
         if (!isCurrent()) return;
-        if (!pdfjsReady) throw new Error(pdfjsInitError || 'PDF.js初期化失敗');
+        if (!pdfjsReady) throw new Error(pdfjsInitError || 'PDF.js initialization failed');
         showStep('PDF読み込み中…');
-        const pdfUrl = await invoke('get_pdf_stream_url', { filePath: book.filePath });
+        const pdfUrl = await wait(invoke('get_pdf_stream_url', { filePath: book.filePath }), 'url');
         if (!isCurrent()) return;
-        // Range-only loading avoids downloading every byte of a large PDF while idle.
+        const runtime = createPdfRuntime(attempt, error => {
+            // A worker may fail after loading has finished, when there is no
+            // pending load promise left to reach the catch block below.
+            if (!isCurrent() || !state.loaded) return;
+            console.error('PDF worker failed after loading:', error);
+            showPdfLoadFailure(tabId, state, error);
+            releasePdfDocument(state);
+        });
+        state.pdfRuntime = runtime;
         const loadingTask = pdfjsLib.getDocument({
             url: pdfUrl,
+            worker: runtime.worker,
             disableAutoFetch: true,
             disableStream: true,
             canvasMaxAreaInBytes: 16 * 1024 * 1024,
         });
         state.loadingTask = loadingTask;
-        const doc = await loadingTask.promise;
-        if (!isCurrent()) {
-            await loadingTask.destroy();
-            return;
-        }
+        let loadedBytes = 0;
+        loadingTask.onProgress = progress => {
+            if (!isCurrent() || !(progress.loaded > loadedBytes)) return;
+            loadedBytes = progress.loaded;
+            attempt.touchProgress?.();
+        };
+        const doc = await wait(loadingTask.promise, 'document');
+        if (!isCurrent()) return;
         state.pdfDoc = doc;
         state.totalPages = doc.numPages;
         state.currentPage = Math.max(1, Math.min(state.currentPage, doc.numPages));
-        const [comments, bookmarks] = await Promise.all([
+        const [comments, bookmarks] = await wait(Promise.all([
             invoke('get_comments', { bookId: book.id }),
             invoke('get_bookmarks', { bookId: book.id }),
-        ]);
+        ]), 'metadata');
         if (!isCurrent()) return;
         state.comments = comments;
         state.bookmarks = bookmarks;
@@ -1120,16 +1277,11 @@ async function loadPdfForTab(tabId, book) {
         if (activeTabId === tabId) showPdfTab(tabId);
     } catch (error) {
         if (!isCurrent()) return;
-        console.error('Failed to load PDF:', error);
-        await releasePdfDocument(state);
-        if (pdfStates[tabId] === state && activeTabId === tabId && !state.loading) {
-            const loading = document.getElementById('viewer-loading');
-            loading.style.display = 'flex';
-            loading.replaceChildren();
-            const paragraph = document.createElement('p');
-            paragraph.textContent = `PDFの読み込みに失敗しました: ${String(error.message || error)}`;
-            loading.appendChild(paragraph);
-        }
+        console.error(`Failed to load PDF (${attempt.phase}):`, error);
+        // Show a useful failure immediately. Cleanup has its own independent
+        // deadline; an unresponsive worker must never hide this retry action.
+        showPdfLoadFailure(tabId, state, error);
+        releasePdfDocument(state);
     }
 }
 
@@ -1146,7 +1298,7 @@ function getPdfCanvasSize(viewport, maxPixels, maxDpr = 2) {
     };
 }
 
-async function cleanupPdfDocument(state, doc) {
+async function cleanupPdfDocument(state, doc, runtime) {
     if (state.pdfDoc !== doc) return;
     // PDF.js defers operator-stream cancellation for 100 ms after RenderTask.cancel.
     // Its render promise has already rejected at that point; wait for the stream
@@ -1154,7 +1306,7 @@ async function cleanupPdfDocument(state, doc) {
     const remaining = 120 - (Date.now() - (state.renderCancelledAt || 0));
     if (remaining > 0) await new Promise(resolve => setTimeout(resolve, remaining));
     if (state.pdfDoc !== doc) return;
-    try { await doc.cleanup(true); } catch (error) {
+    try { await waitForPdfSession(doc.cleanup(true), runtime); } catch (error) {
         if (state.pdfDoc === doc) console.warn('PDF cache cleanup failed:', error);
     }
 }
@@ -1167,6 +1319,7 @@ function renderPdfPages(tabId, preserveScroll = false) {
     state.needsRender = true;
     const generation = state.renderGeneration;
     const doc = state.pdfDoc;
+    const runtime = state.pdfRuntime;
     const isCurrent = () => pdfStates[tabId] === state && state.pdfDoc === doc &&
         state.renderGeneration === generation && activeTabId === tabId && document.visibilityState !== 'hidden';
     return enqueuePdfWork(async () => {
@@ -1238,14 +1391,14 @@ function renderPdfPages(tabId, preserveScroll = false) {
         } finally {
             releaseCanvasTree(tempHolder);
             tempHolder.remove();
-            await cleanupPdfDocument(state, doc);
+            await cleanupPdfDocument(state, doc, runtime);
         }
         if (isCurrent() && state.thumbnailsOpen) generateThumbnails(tabId);
     });
 }
 
 async function createRenderedPage(state, frame, pageNum, tabId, holder, maxPixels, isCurrent) {
-    const page = await frame.pdfDoc.getPage(pageNum);
+    const page = await waitForPdfSession(frame.pdfDoc.getPage(pageNum), frame.pdfRuntime);
     let renderTask;
     try {
         if (!isCurrent()) return;
@@ -1273,11 +1426,11 @@ async function createRenderedPage(state, frame, pageNum, tabId, holder, maxPixel
             transform: [size.width / viewport.width, 0, 0, size.height / viewport.height, 0, 0],
         });
         state.renderTasks.add(renderTask);
-        await renderTask.promise;
+        await waitForPdfSession(renderTask.promise, frame.pdfRuntime);
         state.renderTasks.delete(renderTask);
         if (!isCurrent()) return;
         if (frame.nightMode) applyNightFilterToCanvas(canvas, ctx);
-        await renderPageTextLayer(page, viewport, wrapper, state, isCurrent);
+        await renderPageTextLayer(page, viewport, wrapper, state, isCurrent, frame.pdfRuntime);
         if (!isCurrent()) return;
         // Add comment markers for this page
         const pageComments = (state.comments || []).filter(c => c.pageNum === pageNum);
@@ -1312,18 +1465,18 @@ async function createRenderedPage(state, frame, pageNum, tabId, holder, maxPixel
     }
 }
 
-async function readPageTextContent(page, state, isCurrent) {
+async function readPageTextContent(page, state, isCurrent, runtime = state.pdfRuntime) {
     // Some WKWebView versions have ReadableStream.getReader(), but no async
     // iterator. PDF.js's getTextContent() uses for-await and leaks an unconsumed
     // text stream on those versions. Consume it explicitly, with early bounds.
-    if (!page.streamTextContent) return page.getTextContent({ includeMarkedContent: true });
+    if (!page.streamTextContent) return waitForPdfSession(page.getTextContent({ includeMarkedContent: true }), runtime);
     const reader = page.streamTextContent({ includeMarkedContent: true }).getReader();
     (state.textReaders ||= new Set()).add(reader);
     const textContent = { items: [], styles: Object.create(null), lang: null };
     let characters = 0;
     try {
         while (isCurrent()) {
-            const { value, done } = await reader.read();
+            const { value, done } = await waitForPdfSession(reader.read(), runtime);
             if (done) return textContent;
             if (!isCurrent()) return null;
             textContent.lang ??= value.lang;
@@ -1339,12 +1492,14 @@ async function readPageTextContent(page, state, isCurrent) {
         state.textReaders.delete(reader);
         // PDF.js's message stream requires an Error reason to mark its controller
         // closed before late worker chunks arrive (a reasonless cancel asserts).
-        try { await reader.cancel(new Error('PDF text reader released')); } catch (_error) { /* worker may already be destroyed */ }
-        reader.releaseLock();
+        try {
+            await waitForPdfSession(reader.cancel(new Error('PDF text reader released')), runtime);
+        } catch (_error) { /* worker may already be destroyed */ }
+        try { reader.releaseLock(); } catch (_error) { /* interrupted read may still be closing */ }
     }
 }
 
-async function renderPageTextLayer(page, viewport, wrapper, state, isCurrent) {
+async function renderPageTextLayer(page, viewport, wrapper, state, isCurrent, runtime) {
     if (!pdfjsLib?.TextLayer || !page?.getTextContent || !isCurrent()) return;
     const textLayerDiv = document.createElement('div');
     textLayerDiv.className = 'textLayer';
@@ -1352,7 +1507,7 @@ async function renderPageTextLayer(page, viewport, wrapper, state, isCurrent) {
     wrapper.appendChild(textLayerDiv);
     let textLayer;
     try {
-        const textContent = await readPageTextContent(page, state, isCurrent);
+        const textContent = await readPageTextContent(page, state, isCurrent, runtime);
         if (!textContent || !isCurrent()) {
             textLayerDiv.remove();
             return;
@@ -1366,7 +1521,7 @@ async function renderPageTextLayer(page, viewport, wrapper, state, isCurrent) {
         }
         textLayer = new pdfjsLib.TextLayer({ textContentSource: textContent, container: textLayerDiv, viewport });
         state.textLayers.add(textLayer);
-        await textLayer.render();
+        await waitForPdfSession(textLayer.render(), runtime);
         if (!isCurrent() || !textLayerDiv.textContent.trim()) textLayerDiv.remove();
     } catch (error) {
         textLayerDiv.remove();
@@ -1556,6 +1711,7 @@ function generateThumbnails(tabId) {
     cancelThumbnailRendering(state);
     const generation = state.thumbnailGeneration;
     const doc = state.pdfDoc;
+    const runtime = state.pdfRuntime;
     const theme = nightMode;
     const isCurrent = () => pdfStates[tabId] === state && state.pdfDoc === doc &&
         state.thumbnailGeneration === generation && state.thumbnailsOpen && activeTabId === tabId &&
@@ -1594,7 +1750,7 @@ function generateThumbnails(tabId) {
             if (!canvas || canvas.dataset.rendered === 'true') continue;
             let page, task;
             try {
-                page = await doc.getPage(i);
+                page = await waitForPdfSession(doc.getPage(i), runtime);
                 if (!isCurrent()) return;
                 const original = page.getViewport({ scale: 1 });
                 const scale = Math.min(0.2, 120 / original.width, 180 / original.height);
@@ -1608,7 +1764,7 @@ function generateThumbnails(tabId) {
                 task = page.render({ canvasContext: ctx, viewport,
                     transform: [size.width / viewport.width, 0, 0, size.height / viewport.height, 0, 0] });
                 state.thumbnailTask = task;
-                await task.promise;
+                await waitForPdfSession(task.promise, runtime);
                 if (!isCurrent()) return;
                 if (theme) applyNightFilterToCanvas(canvas, ctx);
                 canvas.dataset.rendered = 'true';
@@ -1619,7 +1775,7 @@ function generateThumbnails(tabId) {
                 if (canvas.dataset.rendered !== 'true') canvas.width = canvas.height = 0;
                 page?.cleanup();
                 // Shared image objects can be much larger than these tiny thumbnails.
-                await cleanupPdfDocument(state, doc);
+                await cleanupPdfDocument(state, doc, runtime);
             }
         }
     });

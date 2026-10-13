@@ -3,6 +3,8 @@
 import argparse
 import http.server
 import pathlib
+import json
+import threading
 import urllib.parse
 
 parser = argparse.ArgumentParser()
@@ -10,13 +12,25 @@ parser.add_argument("--source", type=pathlib.Path, required=True)
 parser.add_argument("--script", type=pathlib.Path, required=True)
 parser.add_argument("--fixture", type=pathlib.Path, required=True)
 parser.add_argument("--port", type=int, default=18763)
+parser.add_argument("--scenario", choices=("memory", "loading"), default="memory")
+parser.add_argument("--pdf-module", type=pathlib.Path)
 args = parser.parse_args()
 here = pathlib.Path(__file__).resolve().parent
+gates = {}
+gates_lock = threading.Lock()
+
+
+def get_gate(token):
+    if not token or not token.replace("-", "").isalnum() or len(token) > 64:
+        raise ValueError("Invalid test gate")
+    with gates_lock:
+        return gates.setdefault(token, {"event": threading.Event(), "requests": 0, "timedOut": False})
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path).path
+        query = urllib.parse.parse_qs(urllib.parse.urlsplit(self.path).query)
         if path in ("/", "/index.html"):
             body = (args.source / "index.html").read_bytes().replace(
                 b'<script src="js/bookshelf.js"></script>',
@@ -24,9 +38,25 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_blob(body, "text/html; charset=utf-8")
         elif path == "/js/bookshelf.js":
             self.send_blob(args.script.read_bytes(), "application/javascript")
+        elif path == "/libs/pdf.mjs" and args.pdf_module:
+            self.send_blob(args.pdf_module.read_bytes(), "application/javascript")
         elif path in ("/bridge.js", "/scenario.js"):
-            self.send_blob((here / path[1:]).read_bytes(), "application/javascript")
+            filename = "loading-scenario.js" if path == "/scenario.js" and args.scenario == "loading" else path[1:]
+            self.send_blob((here / filename).read_bytes(), "application/javascript")
+        elif path == "/test-gate" and args.scenario == "loading":
+            gate = get_gate(query.get("token", [""])[0])
+            self.send_blob(json.dumps({"requests": gate["requests"], "released": gate["event"].is_set(),
+                                       "timedOut": gate["timedOut"]}).encode(), "application/json")
         elif path == "/fixture.pdf":
+            token = query.get("testGate", [None])[0]
+            if token and args.scenario == "loading":
+                gate = get_gate(token)
+                with gates_lock:
+                    gate["requests"] += 1
+                # A bounded gate lets the scenario switch/hide after a real PDF.js
+                # worker has requested data, without depending on machine speed.
+                if not gate["event"].wait(timeout=70):
+                    gate["timedOut"] = True
             length = args.fixture.stat().st_size
             start, end = 0, length - 1
             range_header = self.headers.get("Range")
@@ -59,6 +89,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return
             mime = "application/javascript" if target.suffix in (".js", ".mjs") else "text/css" if target.suffix == ".css" else "application/octet-stream"
             self.send_blob(target.read_bytes(), mime)
+
+    def do_POST(self):
+        request = urllib.parse.urlsplit(self.path)
+        if request.path != "/test-gate" or args.scenario != "loading":
+            self.send_error(404)
+            return
+        token = urllib.parse.parse_qs(request.query).get("token", [""])[0]
+        get_gate(token)["event"].set()
+        self.send_blob(b'{"released":true}', "application/json")
 
     def send_blob(self, body, content_type):
         self.send_response(200)

@@ -1,0 +1,191 @@
+{
+  "date": "2026-10-13",
+  "subject": "PDF読み込み中のまま停止する問題の追加検証",
+  "environment": {
+    "host": "macOS standalone WKWebView",
+    "pdfEngine": "bundled PDF.js",
+    "ipc": "asynchronous in-memory stub",
+    "uiAndPdfSameOrigin": true,
+    "persistentAppDataModified": false
+  },
+  "input": {
+    "kind": "本人の実PDFを読み取り専用で参照",
+    "bytes": 103211912,
+    "pages": 308,
+    "requestedPage": 32,
+    "savedZoom": 1.5875431121931427,
+    "documentInstancesUseSameInput": true,
+    "contentOrOriginalHashPublished": false
+  },
+  "sourceSHA256": {
+    "before": {
+      "bookshelfJs": "143152c7e42ff175ae339e2312d6d82a1affbfe20a80f0bb16d231208f70158f",
+      "pdfModule": "105e69d71ebad9fccdddf36b84bb5d038b9d66f6d9db515ddd450c1b4f792432"
+    },
+    "afterFinal": {
+      "bookshelfJs": "5df8efe0883bc7d88c77e4437858a6cd323002b6ecda05c4d964c3c18212fecb",
+      "pdfModule": "b8fa475b8e2b1985602cea61fdb5ac7082ca1d41486c23a50d48752245bbc088"
+    }
+  },
+  "naturalOperationReproduction": {
+    "scenario": "render-evict-return",
+    "injectedFault": false,
+    "steps": [
+      "保存位置からPDF本文の描画を開始",
+      "読み込み済みの別PDFタブへ切り替える",
+      "本棚へ移動し文書上限による旧PDF退避を発生させる",
+      "元のPDFタブへ戻る"
+    ],
+    "before": {
+      "passed": false,
+      "assertionsPassed": 6,
+      "assertionsTotal": 6,
+      "unhandledErrors": 1,
+      "loadingOverlayVisibleAtEnd": true,
+      "pendingDestructionsAtEnd": 1,
+      "terminateRequests": 1,
+      "terminateResponses": 0
+    },
+    "beforeObservedWaitLimitMs": 10000,
+    "beforeDisplayedMessage": "PDF読み込み中…",
+    "after": {
+      "passed": true,
+      "assertionsPassed": 12,
+      "assertionsTotal": 12,
+      "unhandledErrors": 0,
+      "loadingOverlayVisibleAtEnd": false,
+      "pendingDestructionsAtEnd": 0,
+      "terminateRequests": 1,
+      "terminateResponses": 0,
+      "observedRecoveryMs": 3606
+    },
+    "interpretation": "人工障害なしの操作で同じ読み込み待ち画面を再現。終了要求への応答が戻らず、全タブ共通の終了待ちが次のロードを止めた。元ユーザーセッションの全事象が同一原因だったとは断定しない。"
+  },
+  "additionalNaturalScenarios": [
+    {
+      "scenario": "render-close",
+      "injectedFault": false,
+      "description": "文書読み込み後の描画開始中に切替・closeし、別PDFを開く",
+      "before": {
+        "passed": false,
+        "assertionsPassed": 9,
+        "assertionsTotal": 9,
+        "unhandledErrors": 1,
+        "loadingOverlayVisibleAtEnd": true,
+        "pendingDestructionsAtEnd": 1,
+        "terminateRequests": 1,
+        "terminateResponses": 0
+      },
+      "after": {
+        "passed": true,
+        "assertionsPassed": 15,
+        "assertionsTotal": 15,
+        "unhandledErrors": 0,
+        "loadingOverlayVisibleAtEnd": false,
+        "pendingDestructionsAtEnd": 0,
+        "terminateRequests": 1,
+        "terminateResponses": 0,
+        "observedRecoveryMs": 3646
+      },
+      "internalObservation": "page._destroyは解決したが、Terminate応答は未完了。初回の旧実装試験では60秒以上終了Promiseが未解決だった。"
+    },
+    {
+      "scenario": "startup-load-switch-hidden-resume",
+      "injectedFault": false,
+      "description": "3タブ復元、HTTP読込中の切替・再開、20秒の非表示と再表示",
+      "before": {
+        "passed": true,
+        "assertionsPassed": 20,
+        "assertionsTotal": 20,
+        "unhandledErrors": 0,
+        "loadingOverlayVisibleAtEnd": false,
+        "pendingDestructionsAtEnd": 0,
+        "terminateRequests": null,
+        "terminateResponses": null
+      },
+      "after": {
+        "passed": true,
+        "assertionsPassed": 20,
+        "assertionsTotal": 20,
+        "unhandledErrors": 0,
+        "loadingOverlayVisibleAtEnd": false,
+        "pendingDestructionsAtEnd": 0,
+        "terminateRequests": 2,
+        "terminateResponses": 2
+      }
+    }
+  ],
+  "injectedFaultScenarios": [
+    {
+      "scenario": "destroy-stall",
+      "injectedFault": true,
+      "injection": "実worker破棄完了後にdestroy返却Promiseだけを保留",
+      "beforeTimedOutAfterMs": 10000,
+      "afterObservedRecoveryMs": 3641,
+      "afterAssertionsPassed": 14,
+      "afterBookshelfJsSHA256": "5df8efe0883bc7d88c77e4437858a6cd323002b6ecda05c4d964c3c18212fecb",
+      "versionNote": "追加vendor修正前の中間検証。最終版では自然操作の復旧を再確認した。"
+    },
+    {
+      "scenario": "terminate-stall",
+      "injectedFault": true,
+      "injection": "Terminate応答を保留し、実HTTP Rangeリクエストも未応答にする",
+      "beforeTimedOutAfterMs": 10000,
+      "beforePendingHttpAborts": 0,
+      "afterObservedRecoveryMs": 3981,
+      "afterPendingHttpAbortObserved": true,
+      "afterNativeWorkerTerminationObserved": true,
+      "afterAssertionsPassed": 15,
+      "afterPdfModuleSHA256": "9ba097810440bc6e322913b7527f5ffb7a5466888f8e4ea52e22ef75516075e5",
+      "versionNote": "HTTPキャンセル前倒し後、AbortError cleanup追加前の中間検証。"
+    },
+    {
+      "scenario": "load-stall",
+      "injectedFault": true,
+      "injection": "実PDF.jsのロード結果Promiseをアプリへ返さない",
+      "after": {
+        "passed": true,
+        "assertionsPassed": 10,
+        "assertionsTotal": 10,
+        "unhandledErrors": 0,
+        "loadingOverlayVisibleAtEnd": false,
+        "pendingDestructionsAtEnd": 0,
+        "terminateRequests": 2,
+        "terminateResponses": 2,
+        "observedRecoveryMs": 60210
+      },
+      "retryButtonRestoredPage": 32
+    }
+  ],
+  "finalVerification": {
+    "wkScenariosPassed": 4,
+    "wkAssertionsPassed": 57,
+    "wkAssertionsTotal": 57,
+    "wkUnhandledErrors": 0,
+    "nodeTestsPassed": 39,
+    "nodeTestsTotal": 39,
+    "cargoCheckPassed": true
+  },
+  "limitations": [
+    "WK試験は同一HTTP originとIPC stub。実Tauriのorigin、Rustサーバ、CSP、IPCは別検証が必要。",
+    "元のユーザーセッションの操作時刻・内部Promiseを直接記録したものではない。",
+    "PC全体のスリープやOSのメモリ強制終了はこの追加試験では実行していない。",
+    "cMap未設定による既存フォント警告を観測。本文canvasの描画は確認したが、この実PDFの文字選択は確認対象外。"
+  ],
+  "privacy": "原本名、原本パス、原本SHA、PID、本文、ページ画像、ローカル原ログを含めない集計記録。",
+  "packagedAppSmokeTest": {
+    "bundle": "Paperstock_2.0.0_aarch64.dmg",
+    "dmgSHA256": "1846f7bb6e5995fd037f623d7d5fe8b39db864b5138be6b77b56980a91240588",
+    "isolation": "DMG内アプリをコピーし、検証専用bundle ID・PAPERSTOCK_DATA_DIRで起動。実利用DBは変更しない。",
+    "input": "独立WKWebViewと同じ実PDFのローカルコピー2冊",
+    "observations": [
+      "308ページのメタデータ取得",
+      "別タブ→本棚→元PDFへの復帰",
+      "33ページ・159%の本文を画面で確認",
+      "Cmd+Qで正常終了"
+    ],
+    "visibilityCaveat": "自動操作中はmacOSがwindow occluded=1と判定し描画を休止。全画面化と解除で可視状態に戻し本文を確認。ネイティブ試験の復帰時間は計測していない。",
+    "screenshotsPublished": false,
+    "bundlePersonalHomePathsFound": 0
+  }
+}

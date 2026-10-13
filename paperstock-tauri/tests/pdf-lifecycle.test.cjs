@@ -14,12 +14,15 @@ function createApp({ streamUrl, getDocument, fixedTime, clock } = {}) {
     const elements = new Map();
     const calls = [];
     const documents = [];
+    const workers = [];
     const makeElement = () => ({
-        dataset: {}, style: {}, children: [],
+        dataset: {}, style: {}, children: [], listeners: new Map(),
         classList: { toggle() {}, add() {}, remove() {} },
         replaceChildren() { this.children = []; },
         appendChild(child) { this.children.push(child); },
         querySelectorAll: () => [],
+        addEventListener(event, callback) { this.listeners.set(event, callback); },
+        click() { this.listeners.get('click')?.(); },
     });
     const context = vm.createContext({
         window: { devicePixelRatio: 3, __TAURI__: {
@@ -31,7 +34,7 @@ function createApp({ streamUrl, getDocument, fixedTime, clock } = {}) {
             event: { listen: async () => () => {} },
             webviewWindow: { getCurrentWebviewWindow: () => ({}) },
         } },
-        document: { addEventListener() {}, visibilityState: 'visible', body: makeElement(),
+        document: { addEventListener() {}, querySelectorAll: () => [], visibilityState: 'visible', body: makeElement(),
             createElement: makeElement,
             getElementById(id) {
                 if (!elements.has(id)) elements.set(id, makeElement());
@@ -45,6 +48,14 @@ function createApp({ streamUrl, getDocument, fixedTime, clock } = {}) {
         requestAnimationFrame: callback => callback(),
         testClock: clock,
         Error,
+        AbortController,
+        Worker: class {
+            constructor() { this.listeners = new Map(); this.terminated = false; workers.push(this); }
+            addEventListener(event, callback) { this.listeners.set(event, callback); }
+            removeEventListener(event) { this.listeners.delete(event); }
+            terminate() { this.terminated = true; }
+            emit(event) { this.listeners.get(event)?.(); }
+        },
         makeDocument(options) {
             if (getDocument) return getDocument(options);
             const doc = { numPages: 24, destroyed: false };
@@ -62,7 +73,11 @@ function createApp({ streamUrl, getDocument, fixedTime, clock } = {}) {
             lastPage: 7, lastZoom: 1.5, lastScrollY: 0.4, lastSpreadMode: 1, lastSpreadDirection: 0 }));
         tabs = allBooks.map(book => ({ id: 'pdf-' + book.id, type: 'pdf', bookId: book.id, title: book.title }));
         pdfjsReady = true;
-        pdfjsLib = { getDocument: options => makeDocument(options) };
+        pdfjsLib = {
+            getDocument: options => makeDocument(options),
+            GlobalWorkerOptions: { workerSrc: 'blob:test-worker' },
+            PDFWorker: { create: ({ port }) => ({ port, destroy() { this.destroyed = true; } }) },
+        };
         showPdfTab = () => {};
         renderTabBar = () => {};
         renderBooks = async () => {};
@@ -79,7 +94,7 @@ function createApp({ streamUrl, getDocument, fixedTime, clock } = {}) {
             scheduleResume: scheduleResumeRecovery,
         };
     `, context);
-    return { api: context.api, documents, calls, context, elements };
+    return { api: context.api, documents, calls, context, elements, workers };
 }
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
@@ -420,4 +435,180 @@ test('superseding a render cancels an in-flight text stream before its next chun
     await reading;
     assert.equal(state.textReaders.size, 0);
     assert.equal(released, 1);
+});
+
+function loadingMessage(app) {
+    return (app.elements.get('viewer-loading')?.children || []).map(child => child.textContent).join(' ');
+}
+
+function setActive(app, id = 1) {
+    vm.runInContext(`activeTabId = 'pdf-${id}';`, app.context);
+}
+
+test('a load error is visible and retryable before an unresponsive destroy finishes', async () => {
+    const clock = createClock();
+    const app = createApp({ clock, getDocument: () => ({
+        promise: Promise.reject(new Error('/private/sensitive/path.pdf failed')),
+        destroy: () => new Promise(() => {}),
+    }) });
+    setActive(app);
+    await app.api.load(1);
+    assert.match(loadingMessage(app), /PDFを開けませんでした/);
+    assert.match(loadingMessage(app), /再試行/);
+    assert.doesNotMatch(loadingMessage(app), /sensitive|private/);
+    assert.equal(app.api.state(1).loading, false);
+    assert.equal(app.workers[0].terminated, false);
+    await clock.advance(3000);
+    assert.equal(app.workers[0].terminated, true);
+    assert.equal(vm.runInContext('pdfPendingDestructions.size', app.context), 0);
+});
+
+test('destroy timeout terminates the owned worker before admitting a different tab', async () => {
+    const clock = createClock();
+    const destroy = deferred();
+    let loads = 0;
+    const app = createApp({ clock, getDocument: options => {
+        const index = ++loads;
+        if (index > 1) assert.equal(app.workers[0].terminated, true);
+        assert.ok(options.worker.port);
+        return { promise: Promise.resolve({ numPages: 24 }),
+            destroy: () => index === 1 ? destroy.promise : Promise.resolve() };
+    } });
+    await app.api.load(1);
+    const closed = app.api.close(1);
+    const second = app.api.load(2);
+    await tick();
+    await clock.advance(2999);
+    assert.equal(loads, 1);
+    await clock.advance(1);
+    await Promise.all([closed, second]);
+    assert.equal(loads, 2);
+    assert.equal(app.api.state(2).loaded, true);
+    assert.equal(app.workers.filter(worker => !worker.terminated).length, 1);
+    destroy.resolve();
+    await tick();
+    assert.equal(app.workers[1].terminated, false);
+    await app.api.close(2);
+});
+
+test('increasing load progress extends the deadline while duplicate progress does not', async () => {
+    const clock = createClock();
+    let task;
+    const app = createApp({ clock, getDocument: () => task = {
+        promise: new Promise(() => {}), destroy: async () => {},
+    } });
+    setActive(app);
+    const loaded = app.api.load(1);
+    await tick();
+    await clock.advance(59000);
+    task.onProgress({ loaded: 1000 });
+    await clock.advance(59000);
+    assert.equal(app.api.state(1).loading, true);
+    task.onProgress({ loaded: 1000 });
+    await clock.advance(1000);
+    await loaded;
+    assert.equal(app.api.state(1).loading, false);
+    assert.match(loadingMessage(app), /時間内に完了しませんでした/);
+    await tick();
+    assert.equal(app.workers[0].terminated, true);
+});
+
+test('a stalled URL IPC expires without creating a worker and leaves the tab retryable', async () => {
+    const clock = createClock();
+    const app = createApp({ clock, streamUrl: () => new Promise(() => {}) });
+    setActive(app);
+    const loaded = app.api.load(1);
+    await tick();
+    await clock.advance(60000);
+    await loaded;
+    assert.equal(app.api.state(1).loading, false);
+    assert.match(loadingMessage(app), /再試行/);
+    assert.equal(app.workers.length, 0);
+});
+
+test('late load and destruction completions cannot erase a successful retry of the same tab', async () => {
+    const clock = createClock();
+    const oldLoad = deferred(), oldDestroy = deferred();
+    let loads = 0;
+    const newDoc = { numPages: 24 };
+    const app = createApp({ clock, getDocument: () => ++loads === 1
+        ? { promise: oldLoad.promise, destroy: () => oldDestroy.promise }
+        : { promise: Promise.resolve(newDoc), destroy: async () => {} } });
+    setActive(app);
+    const first = app.api.load(1);
+    await tick();
+    app.api.state(1).currentPage = 13;
+    app.api.state(1).scale = 2;
+    await clock.advance(60000);
+    await first;
+    const retry = app.api.load(1);
+    await clock.advance(3000);
+    await retry;
+    assert.equal(app.api.state(1).pdfDoc, newDoc);
+    assert.equal(app.api.state(1).currentPage, 13);
+    assert.equal(app.api.state(1).scale, 2);
+    oldLoad.resolve({ numPages: 2 });
+    oldDestroy.resolve();
+    await tick();
+    assert.equal(app.api.state(1).pdfDoc, newDoc);
+    assert.equal(app.api.state(1).loaded, true);
+    assert.equal(app.workers[1].terminated, false);
+    await app.api.close(1);
+});
+
+test('worker error and messageerror during startup fail the load and release the owned worker', async () => {
+    for (const event of ['error', 'messageerror']) {
+        const app = createApp({ getDocument: () => ({ promise: new Promise(() => {}), destroy: async () => {} }) });
+        setActive(app);
+        const loaded = app.api.load(1);
+        await tick();
+        app.workers[0].emit(event);
+        await loaded;
+        await tick();
+        assert.equal(app.api.state(1).loading, false);
+        assert.match(loadingMessage(app), /再試行/);
+        assert.equal(app.workers[0].terminated, true);
+    }
+});
+
+test('an external AbortError from the current load is a retryable failure, not a silent cancellation', async () => {
+    const error = new Error('network cancelled');
+    error.name = 'AbortError';
+    const app = createApp({ getDocument: () => ({ promise: Promise.reject(error), destroy: async () => {} }) });
+    setActive(app);
+    await app.api.load(1);
+    await tick();
+    assert.equal(app.api.state(1).loading, false);
+    assert.match(loadingMessage(app), /再試行/);
+    assert.equal(app.workers[0].terminated, true);
+});
+
+test('a worker failure after loading changes the active tab to a retryable error', async () => {
+    const app = createApp();
+    setActive(app);
+    await app.api.load(1);
+    assert.equal(app.api.state(1).loaded, true);
+    app.workers[0].emit('error');
+    await tick();
+    assert.equal(app.api.state(1).loaded, false);
+    assert.match(loadingMessage(app), /再試行/);
+    assert.equal(app.workers[0].terminated, true);
+});
+
+test('document cancellation releases a queued worker wait without aborting a newer document', async () => {
+    const app = createApp();
+    await app.api.load(1);
+    const oldRuntime = app.api.state(1).pdfRuntime;
+    app.context.oldRuntime = oldRuntime;
+    const oldWork = vm.runInContext('enqueuePdfWork(() => waitForPdfSession(new Promise(() => {}), oldRuntime))', app.context);
+    await tick();
+    await app.api.release(1);
+    await app.api.load(1);
+    await oldWork;
+    assert.notEqual(app.api.state(1).pdfRuntime, oldRuntime);
+    assert.equal(app.api.state(1).pdfRuntime.controller.signal.aborted, false);
+    assert.equal(app.workers[1].terminated, false);
+    const result = await vm.runInContext('enqueuePdfWork(() => Promise.resolve(42))', app.context);
+    assert.equal(result, 42);
+    await app.api.close(1);
 });
